@@ -10,8 +10,10 @@ Four n8n workflows that implement the QA SOP end to end:
 | WF3 | **QA \| Fix Verification** | `5d3Tygetxk5udWMP` | Manual + daily 10:00 Asia/Karachi | Verify |
 | WF4 | **QA \| Error Handler** | `J5xzUk8hMd46SmLP` | Error Trigger | alerting for WF1–WF3 |
 
-All four are **unpublished drafts** in the personal project of the n8n instance `asad921.app.n8n.cloud`.
-Nothing is published or activated; PRs are never auto-merged and tickets are never auto-closed.
+All four live in the personal project of the n8n instance `asad921.app.n8n.cloud`.
+**WF4 is published** and set as the error workflow of WF1–WF3; WF1–WF3 are still **unpublished drafts**.
+Slack (credential `QA Automation`, channel `#qa-automation`) is connected on the instance and was verified with a live test post.
+PRs are never auto-merged and tickets are never auto-closed.
 
 ```
 Jira (Ready for QA) ──WF1──▶ Test Design ▶ Spec Gen ▶ [API] [Data] ▶ Code Review ⟲(≤2)
@@ -94,7 +96,7 @@ Bug Sheet tab **`Bugs`** header row: `Bug ID | Jira Key | Title | Module | Sever
 3. **n8n credentials.** Create the five credentials above and select them on every node with a credential warning. This includes the HTTP Request nodes, which use *Predefined credential type*.
 4. **Config nodes.** Fill in the Config node in WF1, WF2, WF3, and WF4.
 5. **Jira workflow.** Statuses `Ready for QA`, `Fixed`, `Verified`, `Reopened` must exist, and so must transitions *Fixed → Verified* and *Fixed → Reopened*. WF3 looks transitions up by target status name.
-6. **Publish and wire WF4.** Publish WF4, then in WF1, WF2 and WF3 go to *Workflow settings → Error workflow → QA | Error Handler*. n8n accepts only a published workflow as an error workflow.
+6. **Publish and wire WF4** (done on `asad921.app.n8n.cloud`). Publish WF4, then in WF1, WF2 and WF3 go to *Workflow settings → Error workflow → QA | Error Handler*. n8n accepts only a published workflow as an error workflow.
 7. **Webhook (WF2).** Publish WF2 to get its production URL: `https://<your-n8n>/webhook/qa-ci-result`. In GitHub, add a webhook under *Repo → Settings → Webhooks → Add webhook*:
    - Payload URL: the production URL.
    - Content type: `application/json`.
