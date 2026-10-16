@@ -15,6 +15,7 @@ OUT.mkdir(exist_ok=True)
 STUB = "--stub" in sys.argv
 STUB_PROMPTS = STUB or "--stub-prompts" in sys.argv
 LIB = (SRC / "code" / "_lib.js").read_text()
+UNZIP = (SRC / "code" / "wf2" / "_unzip.js").read_text()
 MODEL_ID = "claude-sonnet-5-5"
 DATA_TABLE_ID = "9mMnRlpTU4S4ezRU"  # qa_runs
 
@@ -44,8 +45,11 @@ def code(name: str) -> str:
     if STUB:
         return json.dumps(f"return $input.all(); // stub {name}")
     body = (SRC / "code" / f"{name}.js").read_text()
-    uses_lib = re.search(r"\b(parseAgentJson|assertSchema|assertFiles|FILE_SCHEMA)\b", body)
-    return lit((LIB + "\n" + body) if uses_lib else body)
+    if re.search(r"\b(parseAgentJson|assertSchema|assertFiles|FILE_SCHEMA)\b", body):
+        body = LIB + "\n" + body
+    if re.search(r"\bunzip\(", body):
+        body = UNZIP + "\n" + body
+    return lit(body)
 
 def prompt(name: str) -> str:
     if STUB_PROMPTS:
@@ -54,7 +58,7 @@ def prompt(name: str) -> str:
 
 def render(path: pathlib.Path) -> str:
     text = path.read_text()
-    text = re.sub(r"__CODE:([a-z0-9-]+)__", lambda m: code(m.group(1)), text)
+    text = re.sub(r"__CODE:([a-z0-9/-]+)__", lambda m: code(m.group(1)), text)
     text = re.sub(r"__PROMPT:([a-z0-9-]+)__", lambda m: prompt(m.group(1)), text)
     text = re.sub(r"__CFG_([A-Z_]+)__", lambda m: f"<SET_ME:{m.group(1)}>", text)
     for k, v in SNIPPETS.items():

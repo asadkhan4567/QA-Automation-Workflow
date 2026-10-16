@@ -1,0 +1,43 @@
+# SOP Stage 4 — nightly regression + E2E across Chromium / Firefox / WebKit, sharded.
+name: qa-nightly
+on:
+  schedule:
+    - cron: '0 21 * * *'   # 02:00 Asia/Karachi
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        project: [chromium, firefox, webkit]
+        shard: [1/2, 2/2]
+    env:
+      CI: 'true'
+      BASE_URL: ${{ secrets.QA_BASE_URL }}
+      API_TOKEN: ${{ secrets.QA_API_TOKEN }}
+      DATABASE_URL: ${{ secrets.QA_DATABASE_URL }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npx playwright install --with-deps ${{ matrix.project }}
+      - run: npx playwright test --project=${{ matrix.project }} --grep "@regression|@e2e" --shard=${{ matrix.shard }}
+      - name: Upload report + traces
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-${{ matrix.project }}-${{ strategy.job-index }}
+          path: |
+            playwright-report
+            results
+            test-results
+          retention-days: 14

@@ -1,0 +1,19 @@
+{
+  "name": "qa-automation-workflow",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Playwright suite driven by the n8n Sprint QA Automation workflows",
+  "scripts": {
+    "test": "playwright test",
+    "test:smoke": "playwright test --grep @smoke",
+    "test:api": "playwright test --grep @api",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.48.2",
+    "@types/node": "20.17.6",
+    "@types/pg": "8.11.10",
+    "pg": "8.13.1",
+    "typescript": "5.6.3"
+  }
+}

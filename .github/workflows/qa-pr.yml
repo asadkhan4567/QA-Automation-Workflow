@@ -1,0 +1,107 @@
+# SOP Stage 4 — Run in CI: PR gate (smoke + API) and n8n-dispatched runs.
+# - pull_request: runs the standard gate on non-draft PRs (n8n opens test PRs as drafts,
+#   so generated tests only run after a human approves them in Slack).
+# - workflow_dispatch: driven by n8n WF1 (new tests) and WF3 (fix verification, repeat-each=10).
+# Always uploads `results-json` (results/results.json only) for n8n WF2 triage,
+# plus the full HTML report / traces.
+name: qa-pr
+run-name: >-
+  ${{ github.event_name == 'workflow_dispatch'
+      && format('qa-pr {0} [{1}]', inputs.ticket, inputs.dispatch_id)
+      || format('qa-pr {0}', github.head_ref) }}
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+    inputs:
+      ticket:
+        description: Jira key under test (e.g. PROJ-123)
+        required: true
+        type: string
+      branch:
+        description: Branch holding the tests (e.g. qa/PROJ-123)
+        required: true
+        type: string
+      grep:
+        description: Playwright --grep (e.g. @PROJ-123 or @checkout)
+        required: true
+        type: string
+      repeat_each:
+        description: '--repeat-each (0 = off; WF3 uses 10)'
+        required: false
+        default: '0'
+        type: string
+      projects:
+        description: Comma-separated Playwright projects
+        required: false
+        default: chromium
+        type: string
+      dispatch_id:
+        description: Correlation id set by n8n (appears in the run name)
+        required: false
+        default: manual
+        type: string
+
+concurrency:
+  group: qa-pr-${{ github.event_name == 'workflow_dispatch' && inputs.dispatch_id || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CI: 'true'
+      BASE_URL: ${{ secrets.QA_BASE_URL }}
+      API_TOKEN: ${{ secrets.QA_API_TOKEN }}
+      DATABASE_URL: ${{ secrets.QA_DATABASE_URL }}
+      GREP: ${{ github.event_name == 'workflow_dispatch' && inputs.grep || '@smoke|@api' }}
+      PROJECTS: ${{ github.event_name == 'workflow_dispatch' && inputs.projects || 'chromium' }}
+      REPEAT_EACH: ${{ github.event_name == 'workflow_dispatch' && inputs.repeat_each || '0' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.branch || github.event.pull_request.head.sha }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+
+      - name: Install browsers
+        run: npx playwright install --with-deps $(echo "$PROJECTS" | tr ',' ' ')
+
+      - name: Run Playwright
+        run: |
+          args=()
+          IFS=',' read -ra P <<< "$PROJECTS"
+          for p in "${P[@]}"; do args+=("--project=$p"); done
+          if [ "$REPEAT_EACH" != "0" ]; then args+=("--repeat-each=$REPEAT_EACH" "--retries=0"); fi
+          npx playwright test --grep "$GREP" "${args[@]}"
+
+      - name: Upload results.json (consumed by n8n WF2)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: results-json
+          path: results/results.json
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload report + traces
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr-gate-report
+          path: |
+            playwright-report
+            results
+            test-results
+          retention-days: 14

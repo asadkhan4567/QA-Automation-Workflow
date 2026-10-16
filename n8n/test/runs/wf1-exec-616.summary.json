@@ -1,0 +1,57 @@
+{
+  "execution": {
+    "id": "616",
+    "workflowId": "WCF3bpxCFfFPp0RD",
+    "mode": "manual",
+    "status": "success",
+    "startedAt": "2026-10-16T19:51:50.505Z",
+    "stoppedAt": "2026-10-16T19:52:14.181Z",
+    "retryOf": null,
+    "retrySuccessId": null,
+    "waitTill": null
+  },
+  "nodes_executed": [
+    "Normalize Tickets",
+    "Skip Tickets Already in qa_runs",
+    "Validate Test Design JSON",
+    "Has Endpoints?",
+    "Validate Review JSON",
+    "Changes Requested & Retries Left?",
+    "Build PR Payload",
+    "PR Info",
+    "Approved?",
+    "Pick Run ID",
+    "Next Ticket",
+    "Loop Tickets"
+  ],
+  "branch": "qa/PROJ-101",
+  "dispatch_id": "PROJ-101-616-1792180312375",
+  "pr_title": "[QA] PROJ-101: automated tests \u2014 Apply a coupon code at checkout",
+  "files": [
+    "tests/pages/checkout.page.ts",
+    "tests/fixtures/checkout.fixture.ts",
+    "tests/e2e/proj-101/coupon.spec.ts",
+    "tests/api/proj-101/coupon.api.spec.ts"
+  ],
+  "pr_info": {
+    "pr_url": "https://github.com/acme/webapp/pull/87",
+    "pr_number": 87,
+    "ticket": "PROJ-101",
+    "branch": "qa/PROJ-101",
+    "review_verdict": "APPROVE"
+  },
+  "approval": {
+    "data": {
+      "approved": true,
+      "respondedAt": "2026-10-16T09:12:00Z"
+    }
+  },
+  "pick_run": {
+    "run_id": "",
+    "run_url": "",
+    "run_found": false
+  },
+  "review_verdict": "APPROVE",
+  "module": "checkout-coupon",
+  "test_cases": 12
+}

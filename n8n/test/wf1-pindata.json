@@ -1,0 +1,162 @@
+{
+ "Run Manually": [
+  {
+   "json": {}
+  }
+ ],
+ "Search Ready-for-QA Tickets": [
+  {
+   "json": {
+    "key": "PROJ-101",
+    "fields": {
+     "summary": "Apply a coupon code at checkout",
+     "description": "As a shopper I want to apply a coupon code at checkout so that I get a discount.\nAC1: Active code SAVE10 reduces the subtotal by 10% and shows 'Coupon applied'.\nAC2: Expired code shows 'This coupon has expired'; total unchanged.\nAC3: Unknown code shows 'Invalid coupon code'.\nAC4: Only one coupon per order -> 'Only one coupon can be applied'.\nAPI: POST /api/cart/{cartId}/coupon {code} -> 200 {code, discount, total}; 400 missing code; 410 expired; 401 unauthenticated; 404 cart not owned.",
+     "labels": [
+      "checkout"
+     ],
+     "components": [
+      {
+       "name": "Checkout"
+      }
+     ],
+     "priority": {
+      "name": "High"
+     },
+     "status": {
+      "name": "Ready for QA"
+     },
+     "issuetype": {
+      "name": "Story"
+     }
+    }
+   }
+  }
+ ],
+ "Test Design Agent": [
+  {
+   "json": {
+    "output": "{\"ticket\": \"PROJ-101\", \"module\": \"checkout-coupon\", \"has_endpoints\": true, \"endpoints\": [{\"method\": \"POST\", \"path\": \"/api/cart/{cartId}/coupon\", \"description\": \"Apply a coupon to a cart\"}], \"touches_db\": false, \"db_entities\": [], \"assumptions\": [\"Cart with 2 x $25 items (subtotal $50) can be seeded via /api/test-support/carts\", \"SUMMER2025 is a seeded expired coupon; WELCOME5 a second valid coupon\"], \"gherkin\": \"Feature: Coupon at checkout\\n  Background:\\n    Given a cart with subtotal $50.00\\n  Scenario: Valid coupon\\n    When I apply \\\"SAVE10\\\"\\n    Then I see \\\"Coupon applied\\\" and total \\\"$45.00\\\"\\n  Scenario: Expired coupon\\n    When I apply \\\"SUMMER2025\\\"\\n    Then I see \\\"This coupon has expired\\\" and total \\\"$50.00\\\"\\n  Scenario: Unknown coupon\\n    When I apply \\\"NOPE-123\\\"\\n    Then I see \\\"Invalid coupon code\\\"\\n  Scenario: Second coupon\\n    Given \\\"SAVE10\\\" is applied\\n    When I apply \\\"WELCOME5\\\"\\n    Then I see \\\"Only one coupon can be applied\\\"\", \"test_matrix\": [{\"id\": \"TC-01\", \"title\": \"valid coupon SAVE10 reduces subtotal by 10%\", \"priority\": \"P0\", \"type\": \"Positive\", \"preconditions\": \"cart $50\", \"steps\": [\"open checkout\", \"apply SAVE10\"], \"expected\": \"'Coupon applied', discount -$5.00, total $45.00\", \"test_data\": \"SAVE10\", \"tags\": [\"@PROJ-101\", \"@checkout-coupon\", \"@smoke\"]}, {\"id\": \"TC-02\", \"title\": \"expired coupon shows error and keeps total\", \"priority\": \"P1\", \"type\": \"Negative\", \"preconditions\": \"cart $50\", \"steps\": [\"apply SUMMER2025\"], \"expected\": \"'This coupon has expired', total $50.00\", \"test_data\": \"SUMMER2025\", \"tags\": [\"@PROJ-101\", \"@checkout-coupon\", \"@regression\"]}, {\"id\": \"TC-03\", \"title\": \"unknown coupon is rejected\", \"priority\": \"P1\", \"type\": \"Negative\", \"preconditions\": \"cart $50\", \"steps\": [\"apply NOPE-123\"], \"expected\": \"'Invalid coupon code', no discount row\", \"test_data\": \"NOPE-123\", \"tags\": [\"@PROJ-101\", \"@checkout-coupon\", \"@regression\"]}, {\"id\": \"TC-04\", \"title\": \"second coupon is refused\", \"priority\": \"P1\", \"type\": \"Negative\", \"preconditions\": \"SAVE10 applied\", \"steps\": [\"apply WELCOME5\"], \"expected\": \"'Only one coupon can be applied', total stays $45.00\", \"test_data\": \"WELCOME5\", \"tags\": [\"@PROJ-101\", \"@checkout-coupon\", \"@regression\"]}, {\"id\": \"TC-05\", \"title\": \"empty and whitespace codes are not submitted\", \"priority\": \"P2\", \"type\": \"Boundary\", \"preconditions\": \"cart $50\", \"steps\": [\"apply ''\", \"apply '   '\"], \"expected\": \"'Enter a coupon code'\", \"test_data\": \"'', '   '\", \"tags\": [\"@PROJ-101\", \"@checkout-coupon\", \"@regression\"]}, {\"id\": \"TC-06\", \"title\": \"script payload in code is rendered as text\", \"priority\": \"P1\", \"type\": \"Security\", \"preconditions\": \"cart $50\", \"steps\": [\"apply <img src=x onerror=alert(1)>\"], \"expected\": \"'Invalid coupon code', no dialog\", \"test_data\": \"XSS payload\", \"tags\": [\"@PROJ-101\", \"@checkout-coupon\", \"@regression\"]}, {\"id\": \"TC-07\", \"title\": \"API 200 valid code\", \"priority\": \"P0\", \"type\": \"Positive\", \"preconditions\": \"token\", \"steps\": [\"POST code SAVE10\"], \"expected\": \"200 {discount:5,total:45}\", \"test_data\": \"SAVE10\", \"tags\": [\"@PROJ-101\", \"@checkout-coupon\", \"@api\", \"@smoke\"]}, {\"id\": \"TC-08\", \"title\": \"API 410 expired code\", \"priority\": \"P1\", \"type\": \"Negative\", \"preconditions\": \"token\", \"steps\": [\"POST SUMMER2025\"], \"expected\": \"410 'This coupon has expired'\", \"test_data\": \"SUMMER2025\", \"tags\": [\"@PROJ-101\", \"@checkout-coupon\", \"@api\", \"@regression\"]}, {\"id\": \"TC-09\", \"title\": \"API 400 missing code\", \"priority\": \"P1\", \"type\": \"Negative\", \"preconditions\": \"token\", \"steps\": [\"POST {}\"], \"expected\": \"400 'code is required'\", \"test_data\": \"{}\", \"tags\": [\"@PROJ-101\", \"@checkout-coupon\", \"@api\", \"@regression\"]}, {\"id\": \"TC-10\", \"title\": \"API 401 without token\", \"priority\": \"P1\", \"type\": \"Security\", \"preconditions\": \"no token\", \"steps\": [\"POST without Authorization\"], \"expected\": \"401\", \"test_data\": \"-\", \"tags\": [\"@PROJ-101\", \"@checkout-coupon\", \"@api\", \"@regression\"]}, {\"id\": \"TC-11\", \"title\": \"API 404 for another user's cart\", \"priority\": \"P1\", \"type\": \"Security\", \"preconditions\": \"token for user A\", \"steps\": [\"POST to user B cart\"], \"expected\": \"404\", \"test_data\": \"foreign cart\", \"tags\": [\"@PROJ-101\", \"@checkout-coupon\", \"@api\", \"@regression\"]}, {\"id\": \"TC-12\", \"title\": \"API SQL injection in code is rejected\", \"priority\": \"P2\", \"type\": \"Security\", \"preconditions\": \"token\", \"steps\": [\"POST ' OR 1=1 --\"], \"expected\": \"400, no SQL error leaked\", \"test_data\": \"' OR 1=1 --\", \"tags\": [\"@PROJ-101\", \"@checkout-coupon\", \"@api\", \"@regression\"]}]}"
+   }
+  }
+ ],
+ "Spec Generator Agent": [
+  {
+   "json": {
+    "output": "{\"ticket\": \"PROJ-101\", \"grep\": \"@PROJ-101\", \"files\": [{\"path\": \"tests/pages/checkout.page.ts\", \"content\": \"import { type Page, type Locator, expect } from '@playwright/test';\\n\\nexport class CheckoutPage {\\n  readonly couponInput: Locator;\\n  readonly applyCouponButton: Locator;\\n  readonly couponMessage: Locator;\\n  readonly subtotal: Locator;\\n  readonly discount: Locator;\\n  readonly total: Locator;\\n\\n  constructor(private readonly page: Page) {\\n    this.couponInput = page.getByTestId('coupon-input');\\n    this.applyCouponButton = page.getByRole('button', { name: 'Apply' });\\n    this.couponMessage = page.getByTestId('coupon-message');\\n    this.subtotal = page.getByTestId('order-subtotal');\\n    this.discount = page.getByTestId('order-discount');\\n    this.total = page.getByTestId('order-total');\\n  }\\n\\n  async open(cartId: string): Promise<void> {\\n    await this.page.goto(`/checkout?cart=${encodeURIComponent(cartId)}`);\\n    await expect(this.couponInput).toBeVisible();\\n  }\\n\\n  async applyCoupon(code: string): Promise<void> {\\n    await this.couponInput.fill(code);\\n    await this.applyCouponButton.click();\\n  }\\n\\n  async expectMessage(text: string): Promise<void> {\\n    await expect(this.couponMessage).toHaveText(text);\\n  }\\n}\\n\"}, {\"path\": \"tests/fixtures/checkout.fixture.ts\", \"content\": \"import { test as base, type APIRequestContext } from '@playwright/test';\\nimport { CheckoutPage } from '../pages/checkout.page';\\n\\ntype CartSeed = { cartId: string; subtotal: number };\\n\\nasync function seedCart(request: APIRequestContext): Promise<CartSeed> {\\n  const res = await request.post('/api/test-support/carts', {\\n    headers: { Authorization: `Bearer ${process.env.API_TOKEN}` },\\n    data: { items: [{ sku: 'TSHIRT-RED-M', qty: 2, unitPrice: 25 }] },\\n  });\\n  if (!res.ok()) throw new Error(`cart seed failed: ${res.status()}`);\\n  return (await res.json()) as CartSeed;\\n}\\n\\nexport const test = base.extend<{ checkout: CheckoutPage; cart: CartSeed }>({\\n  cart: async ({ request }, use) => {\\n    const cart = await seedCart(request);\\n    await use(cart);\\n    await request.delete(`/api/test-support/carts/${cart.cartId}`, {\\n      headers: { Authorization: `Bearer ${process.env.API_TOKEN}` },\\n    });\\n  },\\n  checkout: async ({ page, cart }, use) => {\\n    const checkout = new CheckoutPage(page);\\n    await checkout.open(cart.cartId);\\n    await use(checkout);\\n  },\\n});\\n\\nexport { expect } from '@playwright/test';\\n\"}, {\"path\": \"tests/e2e/proj-101/coupon.spec.ts\", \"content\": \"import { test, expect } from '../../fixtures/checkout.fixture';\\n\\ntest.describe('PROJ-101 coupon at checkout', () => {\\n  test('TC-01 valid coupon SAVE10 reduces subtotal by 10% @PROJ-101 @checkout-coupon @smoke', async ({ checkout }) => {\\n    await checkout.applyCoupon('SAVE10');\\n    await checkout.expectMessage('Coupon applied');\\n    await expect(checkout.discount).toHaveText('-$5.00');\\n    await expect(checkout.total).toHaveText('$45.00');\\n  });\\n\\n  test('TC-02 expired coupon shows error and keeps total @PROJ-101 @checkout-coupon @regression', async ({ checkout }) => {\\n    await checkout.applyCoupon('SUMMER2025');\\n    await checkout.expectMessage('This coupon has expired');\\n    await expect(checkout.total).toHaveText('$50.00');\\n  });\\n\\n  test('TC-03 unknown coupon is rejected @PROJ-101 @checkout-coupon @regression', async ({ checkout }) => {\\n    await checkout.applyCoupon('NOPE-123');\\n    await checkout.expectMessage('Invalid coupon code');\\n    await expect(checkout.discount).toBeHidden();\\n  });\\n\\n  test('TC-04 second coupon is refused @PROJ-101 @checkout-coupon @regression', async ({ checkout }) => {\\n    await checkout.applyCoupon('SAVE10');\\n    await checkout.expectMessage('Coupon applied');\\n    await checkout.applyCoupon('WELCOME5');\\n    await checkout.expectMessage('Only one coupon can be applied');\\n    await expect(checkout.total).toHaveText('$45.00');\\n  });\\n\\n  test('TC-05 empty and whitespace codes are not submitted @PROJ-101 @checkout-coupon @regression', async ({ checkout }) => {\\n    for (const code of ['', '   ']) {\\n      await checkout.applyCoupon(code);\\n      await checkout.expectMessage('Enter a coupon code');\\n    }\\n  });\\n\\n  test('TC-06 script payload in code is rendered as text @PROJ-101 @checkout-coupon @regression', async ({ checkout, page }) => {\\n    const dialogs: string[] = [];\\n    page.on('dialog', (d) => { dialogs.push(d.message()); void d.dismiss(); });\\n    await checkout.applyCoupon('<img src=x onerror=alert(1)>');\\n    await checkout.expectMessage('Invalid coupon code');\\n    expect(dialogs).toEqual([]);\\n  });\\n});\\n\"}], \"notes\": [\"Assumes data-testid on coupon-input, coupon-message, order-subtotal, order-discount, order-total\"]}"
+   }
+  }
+ ],
+ "API Test Generator Agent": [
+  {
+   "json": {
+    "output": "{\"files\": [{\"path\": \"tests/api/proj-101/coupon.api.spec.ts\", \"content\": \"import { test, expect } from '@playwright/test';\\n\\nconst auth = { Authorization: `Bearer ${process.env.API_TOKEN}` };\\n\\nasync function newCart(request: import('@playwright/test').APIRequestContext): Promise<string> {\\n  const res = await request.post('/api/test-support/carts', { headers: auth, data: { items: [{ sku: 'TSHIRT-RED-M', qty: 2, unitPrice: 25 }] } });\\n  expect(res.status()).toBe(201);\\n  return (await res.json()).cartId as string;\\n}\\n\\ntest.describe('POST /api/cart/{cartId}/coupon', () => {\\n  test('TC-07 200 valid code returns discount and total @api @PROJ-101 @checkout-coupon', async ({ request }) => {\\n    const cartId = await newCart(request);\\n    const res = await request.post(`/api/cart/${cartId}/coupon`, { headers: auth, data: { code: 'SAVE10' } });\\n    expect(res.status()).toBe(200);\\n    expect(await res.json()).toMatchObject({ code: 'SAVE10', discount: 5, total: 45 });\\n  });\\n\\n  test('TC-08 410 expired code @api @PROJ-101 @checkout-coupon', async ({ request }) => {\\n    const cartId = await newCart(request);\\n    const res = await request.post(`/api/cart/${cartId}/coupon`, { headers: auth, data: { code: 'SUMMER2025' } });\\n    expect(res.status()).toBe(410);\\n    expect((await res.json()).error).toBe('This coupon has expired');\\n  });\\n\\n  test('TC-09 400 missing code @api @PROJ-101 @checkout-coupon', async ({ request }) => {\\n    const cartId = await newCart(request);\\n    const res = await request.post(`/api/cart/${cartId}/coupon`, { headers: auth, data: {} });\\n    expect(res.status()).toBe(400);\\n    expect((await res.json()).error).toBe('code is required');\\n  });\\n\\n  test('TC-10 401 without token @api @PROJ-101 @checkout-coupon', async ({ request }) => {\\n    const res = await request.post('/api/cart/any-cart/coupon', { data: { code: 'SAVE10' } });\\n    expect(res.status()).toBe(401);\\n  });\\n\\n  test(\\\"TC-11 404 for another user's cart @api @PROJ-101 @checkout-coupon\\\", async ({ request }) => {\\n    const res = await request.post('/api/cart/cart-owned-by-someone-else/coupon', { headers: auth, data: { code: 'SAVE10' } });\\n    expect(res.status()).toBe(404);\\n  });\\n\\n  test(\\\"TC-12 SQL injection in code is rejected @api @PROJ-101 @checkout-coupon\\\", async ({ request }) => {\\n    const cartId = await newCart(request);\\n    const res = await request.post(`/api/cart/${cartId}/coupon`, { headers: auth, data: { code: \\\"' OR 1=1 --\\\" } });\\n    expect(res.status()).toBe(400);\\n    expect(JSON.stringify(await res.json())).not.toMatch(/sql|syntax|stack/i);\\n  });\\n});\\n\"}], \"endpoint_coverage\": [{\"method\": \"POST\", \"path\": \"/api/cart/{cartId}/coupon\", \"scenarios\": [\"200 valid\", \"410 expired\", \"400 missing code\", \"401 no token\", \"404 foreign cart\", \"400 SQL injection\"]}]}"
+   }
+  }
+ ],
+ "Code Review Agent": [
+  {
+   "json": {
+    "output": "{\"verdict\": \"APPROVE\", \"summary\": \"POM + fixture-based cart seeding with teardown, web-first assertions, every matrix row covered and tagged. One minor and one nit.\", \"issues\": [{\"severity\": \"minor\", \"file\": \"tests/e2e/proj-101/coupon.spec.ts\", \"line\": 31, \"problem\": \"TC-05 loops two inputs in one test; a failure on '' hides the whitespace case.\", \"fix\": \"Split into two tests or use test.describe.each.\"}, {\"severity\": \"nit\", \"file\": \"tests/api/proj-101/coupon.api.spec.ts\", \"line\": 5, \"problem\": \"newCart helper duplicates the fixture seed logic.\", \"fix\": \"Export seedCart from tests/fixtures/checkout.fixture.ts.\"}], \"good\": [\"No sleeps\", \"getByTestId/getByRole only\", \"Cart cleanup in fixture teardown\", \"Security cases for XSS, authz and SQLi\"]}"
+   }
+  }
+ ],
+ "GitHub \u00b7 Get Base Branch": [
+  {
+   "json": {
+    "name": "main",
+    "commit": {
+     "sha": "9f2c1e7a4b",
+     "commit": {
+      "tree": {
+       "sha": "4d1b0c99aa"
+      }
+     }
+    }
+   }
+  }
+ ],
+ "GitHub \u00b7 Create Tree": [
+  {
+   "json": {
+    "sha": "7e3a5512cd"
+   }
+  }
+ ],
+ "GitHub \u00b7 Create Commit": [
+  {
+   "json": {
+    "sha": "c0ffee1234"
+   }
+  }
+ ],
+ "GitHub \u00b7 Create Branch qa/KEY": [
+  {
+   "json": {
+    "ref": "refs/heads/qa/PROJ-101",
+    "object": {
+     "sha": "c0ffee1234"
+    }
+   }
+  }
+ ],
+ "GitHub \u00b7 Open Pull Request": [
+  {
+   "json": {
+    "number": 87,
+    "html_url": "https://github.com/acme/webapp/pull/87",
+    "draft": true
+   }
+  }
+ ],
+ "Slack \u00b7 Approve Test PR": [
+  {
+   "json": {
+    "data": {
+     "approved": true,
+     "respondedAt": "2026-10-16T09:12:00Z"
+    }
+   }
+  }
+ ],
+ "GitHub \u00b7 Dispatch qa-pr.yml": [
+  {
+   "json": {}
+  }
+ ],
+ "Jira \u00b7 Add Label qa-automated": [
+  {
+   "json": {}
+  }
+ ],
+ "Jira \u00b7 Comment PR Link": [
+  {
+   "json": {
+    "id": "10442"
+   }
+  }
+ ],
+ "qa_runs \u00b7 Record Dispatched Run": [
+  {
+   "json": {
+    "id": 1,
+    "note": "pinned in test so qa_runs is not polluted"
+   }
+  }
+ ],
+ "GitHub \u00b7 Find Dispatched Run": [
+  {
+   "json": {
+    "total_count": 1,
+    "workflow_runs": [
+     {
+      "id": 11873402211,
+      "display_title": "qa-pr PROJ-101 [dispatch-id-not-known-before-run]",
+      "status": "queued",
+      "html_url": "https://github.com/acme/webapp/actions/runs/11873402211",
+      "created_at": "2026-10-16T09:12:25Z"
+     }
+    ]
+   }
+  }
+ ]
+}

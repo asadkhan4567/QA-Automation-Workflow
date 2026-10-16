@@ -1,0 +1,6 @@
+node_modules/
+playwright-report/
+test-results/
+results/
+.env
+n8n/build/*.stub.sdk.ts
