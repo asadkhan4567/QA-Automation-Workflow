@@ -1,0 +1,2431 @@
+import { workflow, node, trigger, sticky, newCredential, ifElse, splitInBatches, nextBatch, languageModel, expr } from '@n8n/workflow-sdk';
+
+const manualRun = trigger({
+  type: 'n8n-nodes-base.manualTrigger',
+  version: 1,
+  config: { name: 'Run Manually' },
+  output: [{}]
+});
+
+const every2h = trigger({
+  type: 'n8n-nodes-base.scheduleTrigger',
+  version: 1.4,
+  config: { name: 'Every 2 Hours', parameters: { rule: { interval: [{ field: 'hours', hoursInterval: 2 }] } } },
+  output: [{}]
+});
+
+const config = node({
+  type: 'n8n-nodes-base.set',
+  version: 3.4,
+  config: {
+    name: 'Config',
+    parameters: {
+      mode: 'manual',
+      includeOtherFields: false,
+      assignments: {
+        assignments: [
+          { id: 'cfg-jira-project', name: 'JIRA_PROJECT', value: '<SET_ME:JIRA_PROJECT>', type: 'string' },
+          { id: 'cfg-jira-base', name: 'JIRA_BASE_URL', value: '<SET_ME:JIRA_BASE_URL>', type: 'string' },
+          { id: 'cfg-gh-owner', name: 'GITHUB_OWNER', value: '<SET_ME:GITHUB_OWNER>', type: 'string' },
+          { id: 'cfg-gh-repo', name: 'GITHUB_REPO', value: '<SET_ME:GITHUB_REPO>', type: 'string' },
+          { id: 'cfg-base-branch', name: 'BASE_BRANCH', value: 'main', type: 'string' },
+          { id: 'cfg-slack', name: 'SLACK_CHANNEL', value: '<SET_ME:SLACK_CHANNEL>', type: 'string' },
+          { id: 'cfg-qa-url', name: 'QA_BASE_URL', value: '<SET_ME:QA_BASE_URL>', type: 'string' },
+          { id: 'cfg-pr-draft', name: 'PR_DRAFT', value: true, type: 'boolean' }
+        ]
+      }
+    }
+  },
+  output: [{ JIRA_PROJECT: 'PROJ', JIRA_BASE_URL: 'https://example.atlassian.net', GITHUB_OWNER: 'acme', GITHUB_REPO: 'webapp', BASE_BRANCH: 'main', SLACK_CHANNEL: 'qa-automation', QA_BASE_URL: 'https://qa.example.com', PR_DRAFT: true }]
+});
+
+const searchTickets = node({
+  type: 'n8n-nodes-base.jira',
+  version: 1,
+  config: {
+    name: 'Search Ready-for-QA Tickets',
+    retryOnFail: true,
+    maxTries: 3,
+    waitBetweenTries: 5000,
+    parameters: {
+      jiraVersion: 'cloud',
+      resource: 'issue',
+      operation: 'getAll',
+      returnAll: true,
+      options: {
+        jql: expr('project = "{{ $json.JIRA_PROJECT }}" AND sprint in openSprints() AND status = "Ready for QA" AND (labels is EMPTY OR labels != "qa-automated") ORDER BY priority DESC, created ASC'),
+        fields: 'summary,description,labels,components,priority,status,issuetype'
+      }
+    },
+    credentials: { jiraSoftwareCloudApi: newCredential('Jira (JIRA_EMAIL + JIRA_API_TOKEN)') }
+  },
+  output: [{ key: 'PROJ-101', fields: { summary: 'Apply coupon at checkout', description: 'AC1: valid coupon reduces total. AC2: expired coupon shows error.', labels: ['checkout'], components: [{ name: 'Checkout' }], priority: { name: 'High' }, status: { name: 'Ready for QA' }, issuetype: { name: 'Story' } } }]
+});
+
+const normalizeTickets = node({
+  type: 'n8n-nodes-base.code',
+  version: 2,
+  config: { name: 'Normalize Tickets', parameters: { mode: 'runOnceForAllItems', jsCode: ("// Jira issues -> flat ticket objects. Description may be plain text (API v2) or ADF (API v3).\n" +
+      "const cfg = $('Config').first().json;\n" +
+      "function adfToText(node) {\n" +
+      "  if (!node) return '';\n" +
+      "  if (typeof node === 'string') return node;\n" +
+      "  if (node.type === 'text') return node.text || '';\n" +
+      "  const inner = (node.content || []).map(adfToText).join(node.type === 'bulletList' || node.type === 'orderedList' ? '\\n' : '');\n" +
+      "  return ['paragraph', 'heading', 'listItem', 'codeBlock'].includes(node.type) ? inner + '\\n' : inner;\n" +
+      "}\n" +
+      "return $input.all()\n" +
+      "  .filter((i) => i.json && i.json.key)\n" +
+      "  .map((i) => {\n" +
+      "    const f = i.json.fields || {};\n" +
+      "    return {\n" +
+      "      json: {\n" +
+      "        key: i.json.key,\n" +
+      "        summary: f.summary || '',\n" +
+      "        description: adfToText(f.description).trim(),\n" +
+      "        labels: f.labels || [],\n" +
+      "        components: (f.components || []).map((c) => c.name),\n" +
+      "        priority: f.priority?.name || '',\n" +
+      "        status: f.status?.name || '',\n" +
+      "        issuetype: f.issuetype?.name || '',\n" +
+      "        url: `${String(cfg.JIRA_BASE_URL).replace(/\\/$/, '')}/browse/${i.json.key}`,\n" +
+      "      },\n" +
+      "    };\n" +
+      "  });\n") } },
+  output: [{ key: 'PROJ-101', summary: 'Apply coupon at checkout', description: 'AC1 ... AC2 ...', labels: ['checkout'], components: ['Checkout'], priority: 'High', status: 'Ready for QA', issuetype: 'Story', url: 'https://example.atlassian.net/browse/PROJ-101' }]
+});
+
+const skipProcessed = node({
+  type: 'n8n-nodes-base.dataTable',
+  version: 1.1,
+  config: {
+    name: 'Skip Tickets Already in qa_runs',
+    parameters: {
+      resource: 'row',
+      operation: 'rowNotExists',
+      dataTableId: { __rl: true, mode: 'id', value: '9mMnRlpTU4S4ezRU', cachedResultName: 'qa_runs' },
+      matchType: 'anyCondition',
+      filters: { conditions: [{ keyName: 'ticket', keyValue: expr('{{ $json.key }}') }] }
+    }
+  },
+  output: [{ key: 'PROJ-101', summary: 'Apply coupon at checkout', description: 'AC1 ... AC2 ...', labels: ['checkout'], components: ['Checkout'], priority: 'High', status: 'Ready for QA', issuetype: 'Story', url: 'https://example.atlassian.net/browse/PROJ-101' }]
+});
+
+const loopTickets = splitInBatches({ version: 3, config: { name: 'Loop Tickets', parameters: { batchSize: 1 } } });
+
+const currentTicket = node({
+  type: 'n8n-nodes-base.noOp',
+  version: 1,
+  config: { name: 'Current Ticket' },
+  output: [{ key: 'PROJ-101', summary: 'Apply coupon at checkout', description: 'AC1 ... AC2 ...', labels: ['checkout'], components: ['Checkout'], url: 'https://example.atlassian.net/browse/PROJ-101' }]
+});
+
+const designModel = languageModel({
+  type: '@n8n/n8n-nodes-langchain.lmChatAnthropic',
+  version: 1.6,
+  config: {
+    name: 'Claude · Design (t=0.2)',
+    parameters: { model: { __rl: true, mode: 'id', value: 'claude-sonnet-5-5' }, options: { temperature: 0.2, maxTokensToSample: 8000 } },
+    credentials: { anthropicApi: newCredential('Anthropic (ANTHROPIC_API_KEY)') }
+  }
+});
+
+const testDesignAgent = node({
+  type: '@n8n/n8n-nodes-langchain.agent',
+  version: 3.1,
+  config: {
+    name: 'Test Design Agent',
+    parameters: {
+      promptType: 'define',
+      text: expr('Design test cases for this Jira ticket. Return STRICT JSON per the runtime contract.\n\nTICKET:\n{{ JSON.stringify($json, null, 2) }}'),
+      options: { systemMessage: ("<!-- Source skill: asadullahkhan-test-case-writer (SKILL.md body, verbatim) + n8n runtime contract appended below. -->\n" +
+      "\n" +
+      "\n" +
+      "# Test Case Writer\n" +
+      "\n" +
+      "Convert requirements into test cases that actually catch bugs \u2014 not checkbox tests that pass because they're trivial.\n" +
+      "\n" +
+      "## Input sources\n" +
+      "\n" +
+      "The skill works from any of these:\n" +
+      "- User stories (\"As a... I want... so that...\")\n" +
+      "- Acceptance criteria (Given/When/Then or prose)\n" +
+      "- Jira tickets (via Atlassian MCP \u2014 fetch with `Atlassian:getJiraIssue` if only a key/URL is given)\n" +
+      "- Confluence specs (via Atlassian MCP \u2014 `Atlassian:getConfluencePage`)\n" +
+      "- PRDs in Notion (via Notion MCP \u2014 `notion-fetch`)\n" +
+      "- API contracts (OpenAPI/Swagger, Postman collections)\n" +
+      "- Figma designs (via Figma MCP \u2014 for UI flow coverage)\n" +
+      "- Plain-English feature descriptions\n" +
+      "\n" +
+      "If the user provides only a reference (ticket key, URL), fetch the content first. Don't ask them to paste it.\n" +
+      "\n" +
+      "## Output formats\n" +
+      "\n" +
+      "Produce **both** of these by default unless the user specifies one:\n" +
+      "\n" +
+      "### 1. Gherkin scenarios (BDD-ready)\n" +
+      "\n" +
+      "```gherkin\n" +
+      "Feature: [feature name]\n" +
+      "\n" +
+      "  Background:\n" +
+      "    Given [common preconditions]\n" +
+      "\n" +
+      "  Scenario: [happy path \u2014 descriptive name]\n" +
+      "    Given [context]\n" +
+      "    When [action]\n" +
+      "    Then [expected outcome]\n" +
+      "    And [additional assertion]\n" +
+      "\n" +
+      "  Scenario Outline: [parameterized \u2014 for data-driven]\n" +
+      "    Given [context with <param>]\n" +
+      "    When [action]\n" +
+      "    Then [outcome with <expected>]\n" +
+      "\n" +
+      "    Examples:\n" +
+      "      | param | expected |\n" +
+      "      | v1    | r1       |\n" +
+      "      | v2    | r2       |\n" +
+      "```\n" +
+      "\n" +
+      "### 2. Tabular test case matrix\n" +
+      "\n" +
+      "| ID | Title | Priority | Type | Preconditions | Steps | Expected Result | Test Data |\n" +
+      "|---|---|---|---|---|---|---|---|\n" +
+      "\n" +
+      "Priorities: `P0` (blocker/smoke), `P1` (critical path), `P2` (important), `P3` (edge/nice-to-have).\n" +
+      "Types: `Positive`, `Negative`, `Boundary`, `Security`, `Performance`, `Accessibility`, `Usability`.\n" +
+      "\n" +
+      "## Coverage discipline\n" +
+      "\n" +
+      "For every requirement, systematically generate test cases across these dimensions. If a dimension doesn't apply, say so explicitly rather than silently skipping.\n" +
+      "\n" +
+      "### Equivalence partitioning & boundary values\n" +
+      "For every input field: valid class, invalid class, boundary (min, min-1, min+1, max, max-1, max+1), empty, null, whitespace, maximum length, maximum length + 1.\n" +
+      "\n" +
+      "### Negative paths\n" +
+      "What happens with bad input, unauthorized access, missing dependencies, network failure, timeout, concurrent modification, duplicate submission, back button, refresh mid-action?\n" +
+      "\n" +
+      "### Security test cases (always include)\n" +
+      "- Authentication bypass attempts\n" +
+      "- Authorization: can user A access user B's data?\n" +
+      "- Injection: SQL, XSS, command, template\n" +
+      "- CSRF protection\n" +
+      "- Session management: expiry, fixation, concurrent sessions\n" +
+      "- Rate limiting / brute force\n" +
+      "- Sensitive data exposure in responses, logs, URLs\n" +
+      "\n" +
+      "### State & workflow\n" +
+      "For any multi-step flow: test each state transition, invalid transitions, interruption/resumption, rollback, partial failure.\n" +
+      "\n" +
+      "### Data integrity\n" +
+      "Database state before/after, referential integrity, audit trail, soft-delete vs. hard-delete behavior, cascade effects.\n" +
+      "\n" +
+      "### Cross-cutting\n" +
+      "Browser compatibility (if UI), mobile responsiveness, accessibility (keyboard nav, screen reader, WCAG 2.1 AA), localization, timezone handling, concurrent users.\n" +
+      "\n" +
+      "## Automated test skeletons\n" +
+      "\n" +
+      "When the user indicates an automation target (or by default if the requirement is technical), also generate runnable test skeletons. Default framework selection:\n" +
+      "\n" +
+      "- **Web UI**: Playwright (Python preferred, TypeScript if stack is JS/TS)\n" +
+      "- **API**: Pytest + `requests` / `httpx` (Python), RestAssured (Java), Jest + supertest (JS)\n" +
+      "- **Mobile**: Appium with the platform's preferred language binding\n" +
+      "- **Unit**: framework native (Pytest, Jest, JUnit 5)\n" +
+      "\n" +
+      "### Playwright Python example shape\n" +
+      "\n" +
+      "```python\n" +
+      "import pytest\n" +
+      "from playwright.sync_api import Page, expect\n" +
+      "\n" +
+      "class TestLoginFlow:\n" +
+      "    @pytest.fixture(autouse=True)\n" +
+      "    def setup(self, page: Page, base_url: str):\n" +
+      "        self.page = page\n" +
+      "        page.goto(f\"{base_url}/login\")\n" +
+      "\n" +
+      "    def test_valid_credentials_redirects_to_dashboard(self, page: Page):\n" +
+      "        page.get_by_test_id(\"email-input\").fill(\"user@example.com\")\n" +
+      "        page.get_by_test_id(\"password-input\").fill(\"ValidPass123!\")\n" +
+      "        page.get_by_test_id(\"login-submit\").click()\n" +
+      "        expect(page).to_have_url(re.compile(r\".*/dashboard\"))\n" +
+      "        expect(page.get_by_test_id(\"user-menu\")).to_be_visible()\n" +
+      "```\n" +
+      "\n" +
+      "Follow the user's established selector strategy: `data-testid` > `aria-role` > CSS > XPath (last resort). Never default to XPath.\n" +
+      "\n" +
+      "### API test example shape (Pytest + httpx)\n" +
+      "\n" +
+      "```python\n" +
+      "import pytest\n" +
+      "import httpx\n" +
+      "\n" +
+      "class TestUserCreationAPI:\n" +
+      "    def test_create_user_returns_201_with_valid_payload(self, api_client, valid_user_payload):\n" +
+      "        response = api_client.post(\"/users\", json=valid_user_payload)\n" +
+      "        assert response.status_code == 201\n" +
+      "        body = response.json()\n" +
+      "        assert body[\"email\"] == valid_user_payload[\"email\"]\n" +
+      "        assert \"id\" in body\n" +
+      "        assert \"password\" not in body  # security: never leak\n" +
+      "\n" +
+      "    @pytest.mark.parametrize(\"field,value,expected_error\", [\n" +
+      "        (\"email\", \"\", \"email is required\"),\n" +
+      "        (\"email\", \"not-an-email\", \"invalid email format\"),\n" +
+      "        (\"password\", \"short\", \"password must be at least 8 characters\"),\n" +
+      "    ])\n" +
+      "    def test_create_user_validation(self, api_client, valid_user_payload, field, value, expected_error):\n" +
+      "        payload = {**valid_user_payload, field: value}\n" +
+      "        response = api_client.post(\"/users\", json=payload)\n" +
+      "        assert response.status_code == 400\n" +
+      "        assert expected_error in response.json()[\"error\"].lower()\n" +
+      "```\n" +
+      "\n" +
+      "## MCP integrations\n" +
+      "\n" +
+      "- **Atlassian**: When the user references a Jira key (`PROJ-123`) or Confluence URL, fetch it. After generating tests, optionally offer to create sub-tasks in Jira for test execution tracking (ask first \u2014 creating tickets is an explicit-permission action).\n" +
+      "- **Notion**: Fetch PRDs and specs from Notion databases when URLs are given. Offer to write the generated test plan back as a Notion page.\n" +
+      "- **Figma**: For UI features, fetch the design to identify all interactive elements and states, ensuring no screen/modal is missed from coverage.\n" +
+      "\n" +
+      "## Quality gates\n" +
+      "\n" +
+      "Before returning the output, self-check:\n" +
+      "- [ ] Every acceptance criterion has at least one positive and one negative test\n" +
+      "- [ ] Boundary conditions exist for every numeric/length input\n" +
+      "- [ ] At least one security test per feature touching auth, input, or data\n" +
+      "- [ ] Error messages are asserted, not just status codes\n" +
+      "- [ ] Test data is either inline-obvious or referenced as fixtures, never vague (\"some valid input\")\n" +
+      "- [ ] Test names describe behavior, not implementation (`test_rejects_expired_token` not `test_line_42`)\n" +
+      "\n" +
+      "## Edge cases\n" +
+      "\n" +
+      "- **Vague requirement (\"make login work\")**: push back. Ask for acceptance criteria or enumerate assumptions you're making and flag them.\n" +
+      "- **Requirement references external systems not described**: list the assumptions about those systems and flag them as test preconditions.\n" +
+      "- **No automation framework specified**: default per the rules above and state the choice.\n" +
+      "- **Requirement conflicts with itself**: flag the conflict before writing tests. Don't paper over it.\n" +
+      "\n" +
+      "---\n" +
+      "\n" +
+      "# n8n Runtime Contract \u2014 Agent: Test Design (overrides anything above that conflicts)\n" +
+      "\n" +
+      "You run inside an unattended n8n workflow (WF1 \"QA | Design & Automate\"). No human reads your reply directly; a Code node parses it.\n" +
+      "\n" +
+      "- Input: one Jira ticket (key, summary, description, acceptance criteria, labels, components).\n" +
+      "- Do NOT call tools, do NOT ask questions. If the requirement is vague, list your assumptions in `assumptions` and continue.\n" +
+      "- Automation target is **Playwright + TypeScript** (not Python) \u2014 keep any skeleton thinking TS-shaped, but do not emit code here; the Spec Generator writes code.\n" +
+      "- `module` = a short kebab-case feature name (e.g. `checkout`, `user-profile`). It becomes the `@<module>` grep tag.\n" +
+      "- Set `has_endpoints=true` only if the ticket explicitly names HTTP endpoints / API contracts. Set `touches_db=true` only if the ticket changes persisted data, schema, migrations, or reports.\n" +
+      "- Every acceptance criterion needs \u22651 Positive and \u22651 Negative row; include \u22651 Security row when auth/input/data is touched.\n" +
+      "- Tags per row: always `@<TICKET-KEY>` and `@<module>`, plus one of `@smoke` (P0) / `@regression` (P1\u2013P3), and `@api` for API rows.\n" +
+      "\n" +
+      "## Output \u2014 STRICT JSON ONLY\n" +
+      "Return exactly one JSON object. No markdown fences, no prose before/after. Schema:\n" +
+      "\n" +
+      "```json\n" +
+      "{\n" +
+      "  \"ticket\": \"PROJ-123\",\n" +
+      "  \"module\": \"checkout\",\n" +
+      "  \"has_endpoints\": false,\n" +
+      "  \"endpoints\": [{ \"method\": \"POST\", \"path\": \"/api/orders\", \"description\": \"...\" }],\n" +
+      "  \"touches_db\": false,\n" +
+      "  \"db_entities\": [\"orders\"],\n" +
+      "  \"assumptions\": [\"...\"],\n" +
+      "  \"gherkin\": \"Feature: ...\\n  Scenario: ...\",\n" +
+      "  \"test_matrix\": [\n" +
+      "    {\n" +
+      "      \"id\": \"TC-01\",\n" +
+      "      \"title\": \"rejects expired coupon\",\n" +
+      "      \"priority\": \"P1\",\n" +
+      "      \"type\": \"Negative\",\n" +
+      "      \"preconditions\": \"...\",\n" +
+      "      \"steps\": [\"...\", \"...\"],\n" +
+      "      \"expected\": \"...\",\n" +
+      "      \"test_data\": \"...\",\n" +
+      "      \"tags\": [\"@PROJ-123\", \"@checkout\", \"@regression\"]\n" +
+      "    }\n" +
+      "  ]\n" +
+      "}\n" +
+      "```\n" +
+      "Allowed `priority`: P0|P1|P2|P3. Allowed `type`: Positive|Negative|Boundary|Security|Performance|Accessibility|Usability. `test_matrix` must have at least 1 row.\n"), maxIterations: 3 }
+    },
+    subnodes: { model: designModel }
+  },
+  output: [{ output: '{"ticket":"PROJ-101","module":"checkout","has_endpoints":false,"endpoints":[],"touches_db":false,"db_entities":[],"assumptions":[],"gherkin":"Feature: Coupon","test_matrix":[{"id":"TC-01","title":"valid coupon","priority":"P0","type":"Positive","steps":["apply"],"expected":"total reduced","tags":["@PROJ-101","@checkout","@smoke"]}]}' }]
+});
+
+const validateDesign = node({
+  type: 'n8n-nodes-base.code',
+  version: 2,
+  config: { name: 'Validate Test Design JSON', parameters: { mode: 'runOnceForAllItems', jsCode: ("// shared strict-JSON helpers (prepended by n8n/build.py)\n" +
+      "function parseAgentJson(raw, label) {\n" +
+      "  if (raw && typeof raw === 'object') return raw;\n" +
+      "  if (typeof raw !== 'string' || !raw.trim()) throw new Error(`[${label}] empty/non-string agent output`);\n" +
+      "  let s = raw.trim();\n" +
+      "  const m = s.match(/^```(?:json)?\\s*([\\s\\S]*?)\\s*```$/i);\n" +
+      "  if (m) s = m[1].trim();\n" +
+      "  try { return JSON.parse(s); } catch (e) { throw new Error(`[${label}] invalid JSON (${e.message}): ${s.slice(0, 300)}`); }\n" +
+      "}\n" +
+      "// schema: {type:'object'|'array'|'string'|'number'|'boolean'|'any', required, props, items, minItems, enum, pattern, minLength, min, max, nullable}\n" +
+      "function checkSchema(v, s, p, e) {\n" +
+      "  if (v === null || v === undefined) { if (!(s.nullable && v === null)) e.push(`${p} is ${v === null ? 'null' : 'missing'}`); return; }\n" +
+      "  const t = s.type;\n" +
+      "  if (t === 'any') return;\n" +
+      "  if (t === 'object') {\n" +
+      "    if (typeof v !== 'object' || Array.isArray(v)) return void e.push(`${p} must be an object`);\n" +
+      "    (s.required || []).forEach((k) => { if (!(k in v)) e.push(`${p}.${k} is required`); });\n" +
+      "    Object.entries(s.props || {}).forEach(([k, sub]) => { if (k in v) checkSchema(v[k], sub, `${p}.${k}`, e); });\n" +
+      "  } else if (t === 'array') {\n" +
+      "    if (!Array.isArray(v)) return void e.push(`${p} must be an array`);\n" +
+      "    if (s.minItems && v.length < s.minItems) e.push(`${p} needs >= ${s.minItems} items`);\n" +
+      "    if (s.items) v.forEach((x, i) => checkSchema(x, s.items, `${p}[${i}]`, e));\n" +
+      "  } else if (t === 'string') {\n" +
+      "    if (typeof v !== 'string') return void e.push(`${p} must be a string`);\n" +
+      "    if (s.minLength && v.length < s.minLength) e.push(`${p} too short`);\n" +
+      "    if (s.enum && !s.enum.includes(v)) e.push(`${p} must be one of ${s.enum.join('|')} (got \"${v}\")`);\n" +
+      "    if (s.pattern && !new RegExp(s.pattern).test(v)) e.push(`${p} must match /${s.pattern}/`);\n" +
+      "  } else if (t === 'number') {\n" +
+      "    if (typeof v !== 'number' || Number.isNaN(v)) return void e.push(`${p} must be a number`);\n" +
+      "    if (s.min !== undefined && v < s.min) e.push(`${p} must be >= ${s.min}`);\n" +
+      "    if (s.max !== undefined && v > s.max) e.push(`${p} must be <= ${s.max}`);\n" +
+      "  } else if (t === 'boolean') { if (typeof v !== 'boolean') e.push(`${p} must be a boolean`); }\n" +
+      "  else e.push(`${p}: unknown schema type ${t}`);\n" +
+      "}\n" +
+      "function assertSchema(v, s, label) {\n" +
+      "  const e = []; checkSchema(v, s, '$', e);\n" +
+      "  if (e.length) throw new Error(`[${label}] schema mismatch (${e.length}): ${e.slice(0, 12).join('; ')}`);\n" +
+      "  return v;\n" +
+      "}\n" +
+      "const FILE_SCHEMA = { type: 'object', required: ['path', 'content'], props: { path: { type: 'string', minLength: 1 }, content: { type: 'string', minLength: 1 } } };\n" +
+      "function assertFiles(files, prefixes, label) {\n" +
+      "  for (const f of files) {\n" +
+      "    const p = f.path;\n" +
+      "    if (p.includes('..') || p.startsWith('/') || p.includes('\\\\') || !prefixes.some((x) => p.startsWith(x))) throw new Error(`[${label}] path not allowed: \"${p}\" (allowed: ${prefixes.join(', ')})`);\n" +
+      "    if (!p.endsWith('.ts')) throw new Error(`[${label}] only .ts files allowed: \"${p}\"`);\n" +
+      "    if (/waitForTimeout\\s*\\(|setTimeout\\s*\\(/.test(f.content)) throw new Error(`[${label}] hard sleep found in ${p}`);\n" +
+      "  }\n" +
+      "  return files;\n" +
+      "}\n" +
+      "// end shared helpers\n" +
+      "\n" +
+      "const ticket = $('Current Ticket').last().json;\n" +
+      "const design = parseAgentJson($input.first().json.output, 'Test Design');\n" +
+      "assertSchema(design, {\n" +
+      "  type: 'object',\n" +
+      "  required: ['ticket', 'module', 'has_endpoints', 'endpoints', 'touches_db', 'db_entities', 'assumptions', 'gherkin', 'test_matrix'],\n" +
+      "  props: {\n" +
+      "    ticket: { type: 'string', enum: [ticket.key] },\n" +
+      "    module: { type: 'string', pattern: '^[a-z0-9]+(-[a-z0-9]+)*$' },\n" +
+      "    has_endpoints: { type: 'boolean' },\n" +
+      "    endpoints: { type: 'array', items: { type: 'object', required: ['method', 'path'], props: { method: { type: 'string' }, path: { type: 'string' } } } },\n" +
+      "    touches_db: { type: 'boolean' },\n" +
+      "    db_entities: { type: 'array', items: { type: 'string' } },\n" +
+      "    assumptions: { type: 'array', items: { type: 'string' } },\n" +
+      "    gherkin: { type: 'string', minLength: 10 },\n" +
+      "    test_matrix: {\n" +
+      "      type: 'array', minItems: 1,\n" +
+      "      items: {\n" +
+      "        type: 'object',\n" +
+      "        required: ['id', 'title', 'priority', 'type', 'steps', 'expected', 'tags'],\n" +
+      "        props: {\n" +
+      "          id: { type: 'string' }, title: { type: 'string' },\n" +
+      "          priority: { type: 'string', enum: ['P0', 'P1', 'P2', 'P3'] },\n" +
+      "          type: { type: 'string', enum: ['Positive', 'Negative', 'Boundary', 'Security', 'Performance', 'Accessibility', 'Usability'] },\n" +
+      "          steps: { type: 'array', minItems: 1, items: { type: 'string' } },\n" +
+      "          expected: { type: 'string' },\n" +
+      "          tags: { type: 'array', minItems: 1, items: { type: 'string', pattern: '^@' } },\n" +
+      "        },\n" +
+      "      },\n" +
+      "    },\n" +
+      "  },\n" +
+      "}, 'Test Design');\n" +
+      "if (design.has_endpoints && design.endpoints.length === 0) throw new Error('[Test Design] has_endpoints=true but endpoints is empty');\n" +
+      "return [{ json: { ticket, design, attempt: 0, review_feedback: [] } }];\n") } },
+  output: [{ ticket: { key: 'PROJ-101', summary: 'Apply coupon at checkout' }, design: { module: 'checkout', has_endpoints: false, touches_db: false, test_matrix: [] }, attempt: 0, review_feedback: [] }]
+});
+
+const specContext = node({
+  type: 'n8n-nodes-base.noOp',
+  version: 1,
+  config: { name: 'Spec Context' },
+  output: [{ ticket: { key: 'PROJ-101', summary: 'Apply coupon at checkout' }, design: { module: 'checkout', has_endpoints: false, touches_db: false, test_matrix: [] }, attempt: 0, review_feedback: [] }]
+});
+
+const specModel = languageModel({
+  type: '@n8n/n8n-nodes-langchain.lmChatAnthropic',
+  version: 1.6,
+  config: {
+    name: 'Claude · Spec (t=0.2)',
+    parameters: { model: { __rl: true, mode: 'id', value: 'claude-sonnet-5-5' }, options: { temperature: 0.2, maxTokensToSample: 16000 } },
+    credentials: { anthropicApi: newCredential('Anthropic (ANTHROPIC_API_KEY)') }
+  }
+});
+
+const specAgent = node({
+  type: '@n8n/n8n-nodes-langchain.agent',
+  version: 3.1,
+  config: {
+    name: 'Spec Generator Agent',
+    parameters: {
+      promptType: 'define',
+      text: expr('Generate Playwright TypeScript specs (POM + fixtures) for this ticket. Return STRICT JSON per the runtime contract.\n\nTICKET:\n{{ JSON.stringify($json.ticket, null, 2) }}\n\nTEST DESIGN:\n{{ JSON.stringify($json.design, null, 2) }}\n\nREVISION ATTEMPT: {{ $json.attempt }}\nreview_feedback (fix every item; empty on first attempt):\n{{ JSON.stringify($json.review_feedback, null, 2) }}'),
+      options: { systemMessage: ("<!-- Source skill: asadullahkhan-browser-automation (SKILL.md body, verbatim) + n8n runtime contract appended below. -->\n" +
+      "\n" +
+      "\n" +
+      "# Browser Automation\n" +
+      "\n" +
+      "Default to Playwright. Only drop to Selenium when Java + Selenium is explicitly the stack. Never generate flaky code \u2014 flakiness is a bug, not a feature.\n" +
+      "\n" +
+      "## Framework selection\n" +
+      "\n" +
+      "| Situation | Choice |\n" +
+      "|---|---|\n" +
+      "| User didn't specify, stack is Python | **Playwright Python** |\n" +
+      "| User didn't specify, stack is JS/TS | **Playwright TypeScript** |\n" +
+      "| Stack is Java | Selenium 4 + Java |\n" +
+      "| User explicitly asked for Selenium | Honor the ask |\n" +
+      "| User asked for Cypress | Cypress (but note its same-origin limitation if relevant) |\n" +
+      "| Scraping without interactivity | Playwright + parse with BeautifulSoup/cheerio |\n" +
+      "\n" +
+      "## Non-negotiable rules (these prevent flakiness)\n" +
+      "\n" +
+      "1. **No `time.sleep()`, no `Thread.sleep()`, no `cy.wait(5000)` with a number.** Always wait for a condition.\n" +
+      "2. **Selector priority:** `data-testid` > `aria-role` / accessible name > CSS > XPath. XPath is a last resort and must be justified.\n" +
+      "3. **Auto-waiting is your friend.** Playwright's `locator` API auto-waits. Use `expect()` assertions which also auto-wait. Don't wrap these in manual timeouts unless necessary.\n" +
+      "4. **Isolate state.** Every test starts from a known state. Use storage state, API seeding, or teardown \u2014 never depend on test order.\n" +
+      "5. **Page Object Model for anything beyond a throwaway script.** Separate *what* the test does from *how* the page works.\n" +
+      "6. **Parallelism-safe.** No shared global state, no hardcoded ports, no writing to the same file from multiple workers.\n" +
+      "7. **Headful for debugging, headless for CI.** Configurable, not hardcoded.\n" +
+      "\n" +
+      "## Project structure (Playwright Python default)\n" +
+      "\n" +
+      "```\n" +
+      "tests/\n" +
+      "\u251c\u2500\u2500 conftest.py              # fixtures: browser context, auth, api_client\n" +
+      "\u251c\u2500\u2500 pytest.ini               # config\n" +
+      "\u251c\u2500\u2500 playwright.config.py     # if using playwright-pytest extensions\n" +
+      "\u251c\u2500\u2500 pages/                   # Page Object Models\n" +
+      "\u2502   \u251c\u2500\u2500 __init__.py\n" +
+      "\u2502   \u251c\u2500\u2500 base_page.py\n" +
+      "\u2502   \u251c\u2500\u2500 login_page.py\n" +
+      "\u2502   \u2514\u2500\u2500 dashboard_page.py\n" +
+      "\u251c\u2500\u2500 api/                     # API helpers for test data setup\n" +
+      "\u2502   \u2514\u2500\u2500 user_api.py\n" +
+      "\u251c\u2500\u2500 data/                    # test fixtures, not secrets\n" +
+      "\u2502   \u2514\u2500\u2500 users.json\n" +
+      "\u251c\u2500\u2500 e2e/                     # actual tests\n" +
+      "\u2502   \u251c\u2500\u2500 test_login.py\n" +
+      "\u2502   \u2514\u2500\u2500 test_checkout.py\n" +
+      "\u2514\u2500\u2500 .env.example             # env var template \u2014 never commit .env itself\n" +
+      "```\n" +
+      "\n" +
+      "## Page Object Model template (Playwright Python)\n" +
+      "\n" +
+      "```python\n" +
+      "from playwright.sync_api import Page, Locator, expect\n" +
+      "\n" +
+      "class BasePage:\n" +
+      "    def __init__(self, page: Page, base_url: str):\n" +
+      "        self.page = page\n" +
+      "        self.base_url = base_url\n" +
+      "\n" +
+      "    def goto(self, path: str = \"\") -> None:\n" +
+      "        self.page.goto(f\"{self.base_url}{path}\")\n" +
+      "        self.page.wait_for_load_state(\"networkidle\")\n" +
+      "\n" +
+      "\n" +
+      "class LoginPage(BasePage):\n" +
+      "    URL = \"/login\"\n" +
+      "\n" +
+      "    def __init__(self, page: Page, base_url: str):\n" +
+      "        super().__init__(page, base_url)\n" +
+      "        self.email_input: Locator = page.get_by_test_id(\"email-input\")\n" +
+      "        self.password_input: Locator = page.get_by_test_id(\"password-input\")\n" +
+      "        self.submit_button: Locator = page.get_by_test_id(\"login-submit\")\n" +
+      "        self.error_message: Locator = page.get_by_test_id(\"login-error\")\n" +
+      "\n" +
+      "    def navigate(self) -> \"LoginPage\":\n" +
+      "        self.goto(self.URL)\n" +
+      "        expect(self.email_input).to_be_visible()\n" +
+      "        return self\n" +
+      "\n" +
+      "    def login(self, email: str, password: str) -> None:\n" +
+      "        self.email_input.fill(email)\n" +
+      "        self.password_input.fill(password)\n" +
+      "        self.submit_button.click()\n" +
+      "\n" +
+      "    def expect_error(self, message: str) -> None:\n" +
+      "        expect(self.error_message).to_be_visible()\n" +
+      "        expect(self.error_message).to_contain_text(message)\n" +
+      "```\n" +
+      "\n" +
+      "## Test example (Playwright Python)\n" +
+      "\n" +
+      "```python\n" +
+      "import pytest\n" +
+      "from playwright.sync_api import Page, expect\n" +
+      "\n" +
+      "from pages.login_page import LoginPage\n" +
+      "from pages.dashboard_page import DashboardPage\n" +
+      "\n" +
+      "\n" +
+      "class TestLoginFlow:\n" +
+      "    def test_valid_login_redirects_to_dashboard(self, page: Page, base_url: str, valid_user):\n" +
+      "        login = LoginPage(page, base_url).navigate()\n" +
+      "        login.login(valid_user[\"email\"], valid_user[\"password\"])\n" +
+      "\n" +
+      "        dashboard = DashboardPage(page, base_url)\n" +
+      "        expect(page).to_have_url(f\"{base_url}/dashboard\")\n" +
+      "        expect(dashboard.user_menu).to_be_visible()\n" +
+      "        expect(dashboard.user_menu).to_contain_text(valid_user[\"name\"])\n" +
+      "\n" +
+      "    @pytest.mark.parametrize(\"email,password,error\", [\n" +
+      "        (\"\", \"ValidPass123!\", \"email is required\"),\n" +
+      "        (\"invalid@example.com\", \"wrong\", \"invalid credentials\"),\n" +
+      "        (\"locked@example.com\", \"ValidPass123!\", \"account locked\"),\n" +
+      "    ])\n" +
+      "    def test_invalid_login_shows_error(self, page: Page, base_url: str, email, password, error):\n" +
+      "        login = LoginPage(page, base_url).navigate()\n" +
+      "        login.login(email, password)\n" +
+      "        login.expect_error(error)\n" +
+      "```\n" +
+      "\n" +
+      "## Conftest (fixtures) template\n" +
+      "\n" +
+      "```python\n" +
+      "import os\n" +
+      "import pytest\n" +
+      "from playwright.sync_api import Browser, BrowserContext, Page\n" +
+      "\n" +
+      "@pytest.fixture(scope=\"session\")\n" +
+      "def base_url() -> str:\n" +
+      "    return os.environ.get(\"BASE_URL\", \"http://localhost:3000\")\n" +
+      "\n" +
+      "@pytest.fixture\n" +
+      "def context(browser: Browser) -> BrowserContext:\n" +
+      "    ctx = browser.new_context(\n" +
+      "        viewport={\"width\": 1440, \"height\": 900},\n" +
+      "        locale=\"en-US\",\n" +
+      "        timezone_id=\"America/New_York\",\n" +
+      "        ignore_https_errors=False,\n" +
+      "        record_video_dir=\"test-results/videos\" if os.environ.get(\"RECORD\") else None,\n" +
+      "    )\n" +
+      "    ctx.set_default_timeout(10_000)\n" +
+      "    yield ctx\n" +
+      "    ctx.close()\n" +
+      "\n" +
+      "@pytest.fixture\n" +
+      "def page(context: BrowserContext) -> Page:\n" +
+      "    page = context.new_page()\n" +
+      "    yield page\n" +
+      "    page.close()\n" +
+      "\n" +
+      "@pytest.fixture\n" +
+      "def authenticated_page(context: BrowserContext, api_client) -> Page:\n" +
+      "    # Seed auth via API \u2014 faster and more reliable than UI login\n" +
+      "    token = api_client.login(\"test@example.com\", \"password\")\n" +
+      "    context.add_cookies([{\"name\": \"auth\", \"value\": token, \"url\": os.environ[\"BASE_URL\"]}])\n" +
+      "    page = context.new_page()\n" +
+      "    yield page\n" +
+      "    page.close()\n" +
+      "```\n" +
+      "\n" +
+      "## CI configuration (GitHub Actions example)\n" +
+      "\n" +
+      "```yaml\n" +
+      "name: E2E Tests\n" +
+      "on:\n" +
+      "  push:\n" +
+      "    branches: [main]\n" +
+      "  pull_request:\n" +
+      "\n" +
+      "jobs:\n" +
+      "  playwright:\n" +
+      "    runs-on: ubuntu-latest\n" +
+      "    strategy:\n" +
+      "      fail-fast: false\n" +
+      "      matrix:\n" +
+      "        browser: [chromium, firefox, webkit]\n" +
+      "        shard: [1, 2, 3, 4]\n" +
+      "    steps:\n" +
+      "      - uses: actions/checkout@v4\n" +
+      "      - uses: actions/setup-python@v5\n" +
+      "        with:\n" +
+      "          python-version: \"3.12\"\n" +
+      "      - name: Install deps\n" +
+      "        run: |\n" +
+      "          pip install -r requirements.txt\n" +
+      "          playwright install --with-deps ${{ matrix.browser }}\n" +
+      "      - name: Run tests\n" +
+      "        env:\n" +
+      "          BASE_URL: ${{ secrets.STAGING_URL }}\n" +
+      "          TEST_USER_EMAIL: ${{ secrets.TEST_USER_EMAIL }}\n" +
+      "          TEST_USER_PASSWORD: ${{ secrets.TEST_USER_PASSWORD }}\n" +
+      "        run: pytest tests/e2e --browser ${{ matrix.browser }} --shard ${{ matrix.shard }}/4\n" +
+      "      - uses: actions/upload-artifact@v4\n" +
+      "        if: always()\n" +
+      "        with:\n" +
+      "          name: playwright-report-${{ matrix.browser }}-${{ matrix.shard }}\n" +
+      "          path: test-results/\n" +
+      "```\n" +
+      "\n" +
+      "## Selector strategy in depth\n" +
+      "\n" +
+      "1. **`data-testid`** \u2014 stable, explicit, not coupled to styling or copy. Preferred by orders of magnitude.\n" +
+      "2. **Accessible roles** \u2014 `page.get_by_role(\"button\", name=\"Submit\")`. Tests accessibility as a side effect.\n" +
+      "3. **Text content** \u2014 `page.get_by_text(\"Welcome\")`. Fine for user-facing copy, breaks on localization.\n" +
+      "4. **Labels** \u2014 `page.get_by_label(\"Email\")`. Good for form fields.\n" +
+      "5. **CSS** \u2014 `page.locator(\".some-class\")`. Fragile; flag and suggest test IDs.\n" +
+      "6. **XPath** \u2014 `page.locator(\"//div[@class='foo']/span[2]\")`. Almost always a sign of a missing test ID. Justify or refactor.\n" +
+      "\n" +
+      "When the app under test has no `data-testid` attributes, note this in the output and recommend adding them as a first-class improvement.\n" +
+      "\n" +
+      "## Selenium Java equivalents (when required)\n" +
+      "\n" +
+      "- WebDriverWait with ExpectedConditions instead of Thread.sleep\n" +
+      "- Explicit waits only \u2014 no implicit waits (they mix badly with explicit)\n" +
+      "- PageFactory or manual POM\n" +
+      "- TestNG or JUnit 5\n" +
+      "- Selenium Grid / Selenoid for parallel execution\n" +
+      "\n" +
+      "## Scraping-specific concerns\n" +
+      "\n" +
+      "When the task is scraping (not testing):\n" +
+      "- Respect `robots.txt` and the site's ToS\n" +
+      "- Add realistic delays and jitter\n" +
+      "- Rotate user agents if scraping at scale\n" +
+      "- Handle pagination, infinite scroll, lazy loading\n" +
+      "- Use `page.route()` to block unnecessary resources (images, fonts, ads) and speed up\n" +
+      "- Extract structured data into Pydantic models or dataclasses, not raw dicts\n" +
+      "\n" +
+      "## Edge cases\n" +
+      "\n" +
+      "- **Shadow DOM**: Playwright pierces shadow DOM automatically with `locator`. Selenium needs `.shadow_root` navigation.\n" +
+      "- **Iframes**: `page.frame_locator()` in Playwright. Always scope locators to the correct frame.\n" +
+      "- **File uploads**: `locator.set_input_files()` \u2014 don't click-and-OS-dialog.\n" +
+      "- **File downloads**: `with page.expect_download() as download_info`.\n" +
+      "- **Auth flows with OAuth popups**: capture the popup with `context.expect_page()`.\n" +
+      "- **Flaky third-party scripts (analytics, ads)**: block with `page.route(\"**/*analytics*\", lambda r: r.abort())`.\n" +
+      "\n" +
+      "## MCP integrations\n" +
+      "\n" +
+      "- **Figma**: When building automation from a design, pull the design to identify interactive elements and desired states.\n" +
+      "- **Atlassian (Jira)**: Link the automation to the test case/story it validates. Offer to attach the script or link to Jira.\n" +
+      "- **Notion**: For teams that track automation coverage in Notion databases, offer to add an entry.\n" +
+      "\n" +
+      "## Quality gates before returning\n" +
+      "\n" +
+      "- [ ] No `sleep()` calls\n" +
+      "- [ ] Selectors follow the priority order\n" +
+      "- [ ] Page Object Model used (unless explicitly a throwaway)\n" +
+      "- [ ] Tests are independent and parallelizable\n" +
+      "- [ ] CI config included or referenced\n" +
+      "- [ ] Secrets/env vars are externalized, never inlined\n" +
+      "- [ ] Error cases and retries are handled, not swallowed\n" +
+      "\n" +
+      "---\n" +
+      "\n" +
+      "# n8n Runtime Contract \u2014 Agent: Spec Generator (overrides anything above that conflicts)\n" +
+      "\n" +
+      "You run inside an unattended n8n workflow. A Code node parses your reply and commits the files to branch `qa/<KEY>`.\n" +
+      "\n" +
+      "- Stack is fixed: **Playwright Test + TypeScript** (`@playwright/test`). Ignore the Python defaults above.\n" +
+      "- Use Page Object Model and Playwright fixtures. Allowed paths ONLY:\n" +
+      "  - `tests/e2e/<ticket-lowercase>/*.spec.ts` \u2014 specs\n" +
+      "  - `tests/pages/*.ts` \u2014 page objects (class per page, locators as readonly fields)\n" +
+      "  - `tests/fixtures/*.ts` \u2014 `test.extend` fixtures / test data builders\n" +
+      "- Never use `page.waitForTimeout`, `setTimeout`, or sleeps. Use web-first `expect` assertions.\n" +
+      "- Selector priority: `getByTestId` > `getByRole` > `getByLabel`/`getByText` > CSS. XPath forbidden.\n" +
+      "- `baseURL` comes from `playwright.config.ts` (`process.env.BASE_URL`); use relative `page.goto('/path')`. No secrets or hard-coded hosts.\n" +
+      "- Every `test(...)` title MUST contain the tags from the matching test-matrix row, e.g. `test('TC-01 rejects expired coupon @PROJ-123 @checkout @regression', ...)`.\n" +
+      "- Tests must be independent and parallel-safe (no shared mutable state, no order dependence).\n" +
+      "- If `review_feedback` is present, fix EVERY listed issue and return the full corrected file set (not a diff).\n" +
+      "\n" +
+      "## Output \u2014 STRICT JSON ONLY\n" +
+      "One JSON object, no markdown fences, no prose:\n" +
+      "\n" +
+      "```json\n" +
+      "{\n" +
+      "  \"ticket\": \"PROJ-123\",\n" +
+      "  \"grep\": \"@PROJ-123\",\n" +
+      "  \"files\": [\n" +
+      "    { \"path\": \"tests/pages/checkout.page.ts\", \"content\": \"import { type Page, type Locator } from '@playwright/test';\\n...\" },\n" +
+      "    { \"path\": \"tests/e2e/proj-123/checkout.spec.ts\", \"content\": \"...\" }\n" +
+      "  ],\n" +
+      "  \"notes\": [\"missing data-testid on coupon input \u2014 recommend adding\"]\n" +
+      "}\n" +
+      "```\n" +
+      "`files` must contain \u22651 `.spec.ts`. `content` is the full file text.\n"), maxIterations: 3 }
+    },
+    subnodes: { model: specModel }
+  },
+  output: [{ output: '{"ticket":"PROJ-101","grep":"@PROJ-101","files":[{"path":"tests/e2e/proj-101/coupon.spec.ts","content":"// @PROJ-101"}],"notes":[]}' }]
+});
+
+const validateSpec = node({
+  type: 'n8n-nodes-base.code',
+  version: 2,
+  config: { name: 'Validate Spec JSON', parameters: { mode: 'runOnceForAllItems', jsCode: ("// shared strict-JSON helpers (prepended by n8n/build.py)\n" +
+      "function parseAgentJson(raw, label) {\n" +
+      "  if (raw && typeof raw === 'object') return raw;\n" +
+      "  if (typeof raw !== 'string' || !raw.trim()) throw new Error(`[${label}] empty/non-string agent output`);\n" +
+      "  let s = raw.trim();\n" +
+      "  const m = s.match(/^```(?:json)?\\s*([\\s\\S]*?)\\s*```$/i);\n" +
+      "  if (m) s = m[1].trim();\n" +
+      "  try { return JSON.parse(s); } catch (e) { throw new Error(`[${label}] invalid JSON (${e.message}): ${s.slice(0, 300)}`); }\n" +
+      "}\n" +
+      "// schema: {type:'object'|'array'|'string'|'number'|'boolean'|'any', required, props, items, minItems, enum, pattern, minLength, min, max, nullable}\n" +
+      "function checkSchema(v, s, p, e) {\n" +
+      "  if (v === null || v === undefined) { if (!(s.nullable && v === null)) e.push(`${p} is ${v === null ? 'null' : 'missing'}`); return; }\n" +
+      "  const t = s.type;\n" +
+      "  if (t === 'any') return;\n" +
+      "  if (t === 'object') {\n" +
+      "    if (typeof v !== 'object' || Array.isArray(v)) return void e.push(`${p} must be an object`);\n" +
+      "    (s.required || []).forEach((k) => { if (!(k in v)) e.push(`${p}.${k} is required`); });\n" +
+      "    Object.entries(s.props || {}).forEach(([k, sub]) => { if (k in v) checkSchema(v[k], sub, `${p}.${k}`, e); });\n" +
+      "  } else if (t === 'array') {\n" +
+      "    if (!Array.isArray(v)) return void e.push(`${p} must be an array`);\n" +
+      "    if (s.minItems && v.length < s.minItems) e.push(`${p} needs >= ${s.minItems} items`);\n" +
+      "    if (s.items) v.forEach((x, i) => checkSchema(x, s.items, `${p}[${i}]`, e));\n" +
+      "  } else if (t === 'string') {\n" +
+      "    if (typeof v !== 'string') return void e.push(`${p} must be a string`);\n" +
+      "    if (s.minLength && v.length < s.minLength) e.push(`${p} too short`);\n" +
+      "    if (s.enum && !s.enum.includes(v)) e.push(`${p} must be one of ${s.enum.join('|')} (got \"${v}\")`);\n" +
+      "    if (s.pattern && !new RegExp(s.pattern).test(v)) e.push(`${p} must match /${s.pattern}/`);\n" +
+      "  } else if (t === 'number') {\n" +
+      "    if (typeof v !== 'number' || Number.isNaN(v)) return void e.push(`${p} must be a number`);\n" +
+      "    if (s.min !== undefined && v < s.min) e.push(`${p} must be >= ${s.min}`);\n" +
+      "    if (s.max !== undefined && v > s.max) e.push(`${p} must be <= ${s.max}`);\n" +
+      "  } else if (t === 'boolean') { if (typeof v !== 'boolean') e.push(`${p} must be a boolean`); }\n" +
+      "  else e.push(`${p}: unknown schema type ${t}`);\n" +
+      "}\n" +
+      "function assertSchema(v, s, label) {\n" +
+      "  const e = []; checkSchema(v, s, '$', e);\n" +
+      "  if (e.length) throw new Error(`[${label}] schema mismatch (${e.length}): ${e.slice(0, 12).join('; ')}`);\n" +
+      "  return v;\n" +
+      "}\n" +
+      "const FILE_SCHEMA = { type: 'object', required: ['path', 'content'], props: { path: { type: 'string', minLength: 1 }, content: { type: 'string', minLength: 1 } } };\n" +
+      "function assertFiles(files, prefixes, label) {\n" +
+      "  for (const f of files) {\n" +
+      "    const p = f.path;\n" +
+      "    if (p.includes('..') || p.startsWith('/') || p.includes('\\\\') || !prefixes.some((x) => p.startsWith(x))) throw new Error(`[${label}] path not allowed: \"${p}\" (allowed: ${prefixes.join(', ')})`);\n" +
+      "    if (!p.endsWith('.ts')) throw new Error(`[${label}] only .ts files allowed: \"${p}\"`);\n" +
+      "    if (/waitForTimeout\\s*\\(|setTimeout\\s*\\(/.test(f.content)) throw new Error(`[${label}] hard sleep found in ${p}`);\n" +
+      "  }\n" +
+      "  return files;\n" +
+      "}\n" +
+      "// end shared helpers\n" +
+      "\n" +
+      "const ctx = $('Spec Context').last().json;\n" +
+      "const key = ctx.ticket.key;\n" +
+      "const spec = parseAgentJson($input.first().json.output, 'Spec Generator');\n" +
+      "assertSchema(spec, {\n" +
+      "  type: 'object', required: ['ticket', 'grep', 'files'],\n" +
+      "  props: {\n" +
+      "    ticket: { type: 'string', enum: [key] },\n" +
+      "    grep: { type: 'string', pattern: '^@' },\n" +
+      "    files: { type: 'array', minItems: 1, items: FILE_SCHEMA },\n" +
+      "    notes: { type: 'array', items: { type: 'string' } },\n" +
+      "  },\n" +
+      "}, 'Spec Generator');\n" +
+      "assertFiles(spec.files, [`tests/e2e/${key.toLowerCase()}/`, 'tests/pages/', 'tests/fixtures/'], 'Spec Generator');\n" +
+      "if (!spec.files.some((f) => f.path.endsWith('.spec.ts'))) throw new Error('[Spec Generator] no .spec.ts file returned');\n" +
+      "if (!spec.files.filter((f) => f.path.endsWith('.spec.ts')).every((f) => f.content.includes(`@${key}`))) {\n" +
+      "  throw new Error(`[Spec Generator] every spec must carry the @${key} tag`);\n" +
+      "}\n" +
+      "return [{ json: { ...ctx, spec } }];\n") } },
+  output: [{ ticket: { key: 'PROJ-101' }, design: { has_endpoints: false, touches_db: false }, attempt: 0, review_feedback: [], spec: { grep: '@PROJ-101', files: [] } }]
+});
+
+const hasEndpoints = ifElse({
+  version: 2.3,
+  config: {
+    name: 'Has Endpoints?',
+    parameters: {
+      conditions: {
+        options: { caseSensitive: true, leftValue: '', typeValidation: 'strict', version: 2 },
+        conditions: [{ leftValue: expr('{{ $json.design.has_endpoints }}'), rightValue: '', operator: { type: 'boolean', operation: 'true', singleValue: true } }],
+        combinator: 'and'
+      }
+    }
+  }
+});
+
+const apiModel = languageModel({
+  type: '@n8n/n8n-nodes-langchain.lmChatAnthropic',
+  version: 1.6,
+  config: {
+    name: 'Claude · API (t=0.2)',
+    parameters: { model: { __rl: true, mode: 'id', value: 'claude-sonnet-5-5' }, options: { temperature: 0.2, maxTokensToSample: 12000 } },
+    credentials: { anthropicApi: newCredential('Anthropic (ANTHROPIC_API_KEY)') }
+  }
+});
+
+const apiAgent = node({
+  type: '@n8n/n8n-nodes-langchain.agent',
+  version: 3.1,
+  config: {
+    name: 'API Test Generator Agent',
+    parameters: {
+      promptType: 'define',
+      text: expr('Generate Playwright API tests for the endpoints of this ticket. Return STRICT JSON per the runtime contract.\n\nTICKET KEY: {{ $json.ticket.key }}\nMODULE: {{ $json.design.module }}\nENDPOINTS:\n{{ JSON.stringify($json.design.endpoints, null, 2) }}\n\nAPI-RELATED MATRIX ROWS:\n{{ JSON.stringify($json.design.test_matrix.filter(r => (r.tags || []).includes("@api")), null, 2) }}\n\nreview_feedback:\n{{ JSON.stringify($json.review_feedback, null, 2) }}'),
+      options: { systemMessage: ("<!-- Source skill: asadullahkhan-api-documentation (SKILL.md body, verbatim) + n8n runtime contract appended below. -->\n" +
+      "\n" +
+      "\n" +
+      "# API Documentation\n" +
+      "\n" +
+      "Good API docs are a force multiplier \u2014 they enable test automation, client generation, and onboarding. This skill produces docs that are simultaneously readable by humans and consumable by tooling.\n" +
+      "\n" +
+      "## Output deliverables\n" +
+      "\n" +
+      "By default, produce all three unless the user narrows scope:\n" +
+      "\n" +
+      "1. **Human-readable reference** (Markdown)\n" +
+      "2. **OpenAPI 3.1 specification** (YAML)\n" +
+      "3. **Postman Collection v2.1** (JSON) with pre-configured test scripts\n" +
+      "\n" +
+      "If the user asks for \"just the docs\" or \"just the spec\", honor that and skip the others.\n" +
+      "\n" +
+      "## Human-readable reference structure\n" +
+      "\n" +
+      "```markdown\n" +
+      "# <API Name> API Reference\n" +
+      "\n" +
+      "## Overview\n" +
+      "- **Base URL (prod):** https://api.example.com/v1\n" +
+      "- **Base URL (staging):** https://api-staging.example.com/v1\n" +
+      "- **Authentication:** <Bearer JWT | API Key header | OAuth 2.0 | Basic>\n" +
+      "- **Content-Type:** application/json\n" +
+      "- **Rate limits:** <X requests/minute per token>\n" +
+      "- **Versioning strategy:** <URL path | header | query param>\n" +
+      "\n" +
+      "## Authentication\n" +
+      "<Step-by-step on obtaining credentials and authenticating. Include example request.>\n" +
+      "\n" +
+      "## Common conventions\n" +
+      "- **Pagination:** <cursor | offset | page-based \u2014 with examples>\n" +
+      "- **Error format:** <standard error envelope>\n" +
+      "- **Timestamps:** <ISO 8601 UTC>\n" +
+      "- **IDs:** <UUID v4 | integer | custom>\n" +
+      "- **Idempotency:** <Idempotency-Key header if supported>\n" +
+      "\n" +
+      "## Endpoints\n" +
+      "\n" +
+      "### <METHOD> /path/to/resource\n" +
+      "\n" +
+      "**Summary:** <one-line purpose>\n" +
+      "\n" +
+      "**Authentication required:** Yes/No (<scope/role if applicable>)\n" +
+      "\n" +
+      "**Path parameters:**\n" +
+      "| Name | Type | Required | Description | Example |\n" +
+      "|---|---|---|---|---|\n" +
+      "| id  | UUID | Yes      | Resource ID | `550e8400-e29b-41d4-a716-446655440000` |\n" +
+      "\n" +
+      "**Query parameters:**\n" +
+      "| Name | Type | Required | Default | Description |\n" +
+      "|---|---|---|---|---|\n" +
+      "\n" +
+      "**Request headers:**\n" +
+      "| Name | Required | Description |\n" +
+      "|---|---|---|\n" +
+      "\n" +
+      "**Request body schema:**\n" +
+      "```json\n" +
+      "{\n" +
+      "  \"field\": \"type (constraints)\"\n" +
+      "}\n" +
+      "```\n" +
+      "\n" +
+      "**Request example:**\n" +
+      "```bash\n" +
+      "curl -X POST https://api.example.com/v1/users \\\n" +
+      "  -H \"Authorization: Bearer $TOKEN\" \\\n" +
+      "  -H \"Content-Type: application/json\" \\\n" +
+      "  -d '{\"email\": \"user@example.com\", \"name\": \"Jane Doe\"}'\n" +
+      "```\n" +
+      "\n" +
+      "**Success response (201 Created):**\n" +
+      "```json\n" +
+      "{\n" +
+      "  \"id\": \"550e8400-e29b-41d4-a716-446655440000\",\n" +
+      "  \"email\": \"user@example.com\",\n" +
+      "  \"name\": \"Jane Doe\",\n" +
+      "  \"createdAt\": \"2026-04-19T10:30:00Z\"\n" +
+      "}\n" +
+      "```\n" +
+      "\n" +
+      "**Error responses:**\n" +
+      "| Status | Code | Meaning | Example body |\n" +
+      "|---|---|---|---|\n" +
+      "| 400 | `VALIDATION_ERROR` | Invalid payload | `{\"error\": \"email is required\"}` |\n" +
+      "| 401 | `UNAUTHORIZED` | Missing/invalid token | `{\"error\": \"invalid token\"}` |\n" +
+      "| 403 | `FORBIDDEN` | Insufficient permissions | \u2014 |\n" +
+      "| 409 | `CONFLICT` | Email already registered | `{\"error\": \"email exists\"}` |\n" +
+      "| 429 | `RATE_LIMITED` | Too many requests | \u2014 |\n" +
+      "| 500 | `INTERNAL_ERROR` | Server error | \u2014 |\n" +
+      "\n" +
+      "**Test scenarios:**\n" +
+      "- Positive: valid payload \u2192 201 with new resource\n" +
+      "- Negative: missing required field \u2192 400\n" +
+      "- Negative: invalid email format \u2192 400\n" +
+      "- Negative: duplicate email \u2192 409\n" +
+      "- Negative: no auth \u2192 401\n" +
+      "- Negative: wrong-role token \u2192 403\n" +
+      "- Boundary: max-length name, min-length password, unicode, emoji\n" +
+      "- Security: SQL injection in string fields, XSS in name field\n" +
+      "```\n" +
+      "\n" +
+      "## OpenAPI 3.1 output rules\n" +
+      "\n" +
+      "- Use `components/schemas` for all reused types; never inline the same schema twice\n" +
+      "- Include `examples` on every request body and response\n" +
+      "- Use `$ref` for error responses (define once as `components/responses/ValidationError`, etc.)\n" +
+      "- Mark required fields explicitly in `required` array, not via `nullable: false`\n" +
+      "- Include `servers` block with multiple environments\n" +
+      "- Use `tags` to group endpoints by resource/domain\n" +
+      "- Include `security` definitions and per-operation overrides\n" +
+      "\n" +
+      "### Minimal OpenAPI skeleton\n" +
+      "\n" +
+      "```yaml\n" +
+      "openapi: 3.1.0\n" +
+      "info:\n" +
+      "  title: <API Name>\n" +
+      "  version: 1.0.0\n" +
+      "  description: <purpose>\n" +
+      "  contact:\n" +
+      "    name: <team>\n" +
+      "    email: <email>\n" +
+      "servers:\n" +
+      "  - url: https://api.example.com/v1\n" +
+      "    description: Production\n" +
+      "  - url: https://api-staging.example.com/v1\n" +
+      "    description: Staging\n" +
+      "security:\n" +
+      "  - bearerAuth: []\n" +
+      "components:\n" +
+      "  securitySchemes:\n" +
+      "    bearerAuth:\n" +
+      "      type: http\n" +
+      "      scheme: bearer\n" +
+      "      bearerFormat: JWT\n" +
+      "  schemas:\n" +
+      "    Error:\n" +
+      "      type: object\n" +
+      "      required: [error, code]\n" +
+      "      properties:\n" +
+      "        error:\n" +
+      "          type: string\n" +
+      "        code:\n" +
+      "          type: string\n" +
+      "  responses:\n" +
+      "    ValidationError:\n" +
+      "      description: Validation failed\n" +
+      "      content:\n" +
+      "        application/json:\n" +
+      "          schema:\n" +
+      "            $ref: '#/components/schemas/Error'\n" +
+      "paths:\n" +
+      "  /users:\n" +
+      "    post:\n" +
+      "      tags: [Users]\n" +
+      "      summary: Create a user\n" +
+      "      # ...\n" +
+      "```\n" +
+      "\n" +
+      "## Postman Collection rules\n" +
+      "\n" +
+      "Every collection includes:\n" +
+      "\n" +
+      "1. **Environment variables** \u2014 `baseUrl`, `token`, resource IDs captured from prior requests\n" +
+      "2. **Pre-request scripts** \u2014 auto-refresh tokens if near expiry\n" +
+      "3. **Test scripts per request** \u2014 assert status, schema, response time, business rules\n" +
+      "4. **Folder structure** \u2014 one folder per resource/domain\n" +
+      "5. **Auth at collection level** \u2014 inherited by all requests, overridable per request\n" +
+      "\n" +
+      "### Standard test script template (paste into every request)\n" +
+      "\n" +
+      "```javascript\n" +
+      "// Status\n" +
+      "pm.test(\"Status code is expected\", () => {\n" +
+      "    pm.expect(pm.response.code).to.be.oneOf([200, 201]);\n" +
+      "});\n" +
+      "\n" +
+      "// Response time\n" +
+      "pm.test(\"Response time is under 1000ms\", () => {\n" +
+      "    pm.expect(pm.response.responseTime).to.be.below(1000);\n" +
+      "});\n" +
+      "\n" +
+      "// Schema\n" +
+      "const schema = { /* JSON schema */ };\n" +
+      "pm.test(\"Response matches schema\", () => {\n" +
+      "    pm.response.to.have.jsonSchema(schema);\n" +
+      "});\n" +
+      "\n" +
+      "// Business assertions\n" +
+      "const body = pm.response.json();\n" +
+      "pm.test(\"Returned user has id\", () => {\n" +
+      "    pm.expect(body).to.have.property(\"id\");\n" +
+      "    pm.expect(body.id).to.be.a(\"string\").and.not.empty;\n" +
+      "});\n" +
+      "\n" +
+      "// Capture for later requests\n" +
+      "if (body.id) pm.collectionVariables.set(\"lastUserId\", body.id);\n" +
+      "```\n" +
+      "\n" +
+      "## Input handling\n" +
+      "\n" +
+      "### Source code (controllers/routes)\n" +
+      "Parse for endpoints, methods, path params, query params, body schemas, response shapes. Flag anything you're inferring vs. reading directly from source.\n" +
+      "\n" +
+      "### Existing Swagger/OpenAPI\n" +
+      "Enrich, don't overwrite. Add missing examples, error cases, test scenarios. Preserve existing structure and annotations.\n" +
+      "\n" +
+      "### curl commands\n" +
+      "Extract method, URL, headers, body. Generate the surrounding doc and the reverse: what a client library call would look like.\n" +
+      "\n" +
+      "### A running API (user provides base URL + auth)\n" +
+      "Don't hit the API without explicit permission. If granted, map out endpoints systematically, capture real responses as examples.\n" +
+      "\n" +
+      "## Coverage requirements\n" +
+      "\n" +
+      "For every endpoint, the docs must include:\n" +
+      "- [ ] All path, query, header, and body parameters with types and constraints\n" +
+      "- [ ] Authentication requirements\n" +
+      "- [ ] At least one complete request example\n" +
+      "- [ ] At least one success response example\n" +
+      "- [ ] All documented error responses with example bodies\n" +
+      "- [ ] Rate limit behavior if applicable\n" +
+      "- [ ] Pagination behavior for list endpoints\n" +
+      "- [ ] Idempotency behavior for POST/PATCH endpoints\n" +
+      "- [ ] Test scenarios covering positive, negative, boundary, and security cases\n" +
+      "\n" +
+      "## MCP integrations\n" +
+      "\n" +
+      "- **Atlassian (Confluence)**: Offer to publish the human-readable docs as a Confluence page. Use hierarchical pages if the API has many domains (parent page + child page per resource).\n" +
+      "- **Notion**: Alternative publishing target. Use a database with one page per endpoint for filterable/searchable docs.\n" +
+      "- **Microsoft 365 (SharePoint)**: For enterprise environments where docs live in SharePoint.\n" +
+      "\n" +
+      "## Edge cases\n" +
+      "\n" +
+      "- **GraphQL instead of REST**: switch format \u2014 schema-first, document types/queries/mutations/subscriptions, include sample queries.\n" +
+      "- **gRPC**: document the `.proto` contract, message types, service methods, streaming behavior.\n" +
+      "- **Webhooks/async APIs**: document the event payload, delivery semantics (at-least-once, ordering), retry policy, signature verification.\n" +
+      "- **Undocumented internal API**: flag every inference with `<INFERRED>` tags and request confirmation from the implementer.\n" +
+      "\n" +
+      "---\n" +
+      "\n" +
+      "# n8n Runtime Contract \u2014 Agent: API Test Generator (overrides anything above that conflicts)\n" +
+      "\n" +
+      "Runs only when the Test Design output has `has_endpoints=true`. Unattended; a Code node parses your reply.\n" +
+      "\n" +
+      "- Do NOT produce Markdown reference docs, OpenAPI or Postman here. Produce **Playwright API tests in TypeScript** using the `request` fixture (`APIRequestContext`).\n" +
+      "- Allowed paths ONLY: `tests/api/<ticket-lowercase>/*.api.spec.ts` and `tests/fixtures/*.ts`.\n" +
+      "- For each endpoint cover: positive, validation (400), unauthenticated (401), wrong role (403), not found (404) where applicable, boundary, and one injection/security case. Assert error message bodies, not only status codes. Never assert that secrets are present in responses; assert they are absent.\n" +
+      "- Test titles carry `@api @<TICKET-KEY> @<module>`.\n" +
+      "- Auth tokens come from env (`process.env.API_TOKEN`), never inline.\n" +
+      "- If `review_feedback` is present, fix every listed issue.\n" +
+      "\n" +
+      "## Output \u2014 STRICT JSON ONLY\n" +
+      "```json\n" +
+      "{\n" +
+      "  \"files\": [{ \"path\": \"tests/api/proj-123/orders.api.spec.ts\", \"content\": \"...\" }],\n" +
+      "  \"endpoint_coverage\": [{ \"method\": \"POST\", \"path\": \"/api/orders\", \"scenarios\": [\"201 valid\", \"400 missing sku\", \"401 no token\"] }]\n" +
+      "}\n" +
+      "```\n"), maxIterations: 3 }
+    },
+    subnodes: { model: apiModel }
+  },
+  output: [{ output: '{"files":[{"path":"tests/api/proj-101/coupon.api.spec.ts","content":"// @api"}],"endpoint_coverage":[{"method":"POST","path":"/api/coupons/apply","scenarios":["201"]}]}' }]
+});
+
+const validateApi = node({
+  type: 'n8n-nodes-base.code',
+  version: 2,
+  config: { name: 'Validate API JSON', parameters: { mode: 'runOnceForAllItems', jsCode: ("// shared strict-JSON helpers (prepended by n8n/build.py)\n" +
+      "function parseAgentJson(raw, label) {\n" +
+      "  if (raw && typeof raw === 'object') return raw;\n" +
+      "  if (typeof raw !== 'string' || !raw.trim()) throw new Error(`[${label}] empty/non-string agent output`);\n" +
+      "  let s = raw.trim();\n" +
+      "  const m = s.match(/^```(?:json)?\\s*([\\s\\S]*?)\\s*```$/i);\n" +
+      "  if (m) s = m[1].trim();\n" +
+      "  try { return JSON.parse(s); } catch (e) { throw new Error(`[${label}] invalid JSON (${e.message}): ${s.slice(0, 300)}`); }\n" +
+      "}\n" +
+      "// schema: {type:'object'|'array'|'string'|'number'|'boolean'|'any', required, props, items, minItems, enum, pattern, minLength, min, max, nullable}\n" +
+      "function checkSchema(v, s, p, e) {\n" +
+      "  if (v === null || v === undefined) { if (!(s.nullable && v === null)) e.push(`${p} is ${v === null ? 'null' : 'missing'}`); return; }\n" +
+      "  const t = s.type;\n" +
+      "  if (t === 'any') return;\n" +
+      "  if (t === 'object') {\n" +
+      "    if (typeof v !== 'object' || Array.isArray(v)) return void e.push(`${p} must be an object`);\n" +
+      "    (s.required || []).forEach((k) => { if (!(k in v)) e.push(`${p}.${k} is required`); });\n" +
+      "    Object.entries(s.props || {}).forEach(([k, sub]) => { if (k in v) checkSchema(v[k], sub, `${p}.${k}`, e); });\n" +
+      "  } else if (t === 'array') {\n" +
+      "    if (!Array.isArray(v)) return void e.push(`${p} must be an array`);\n" +
+      "    if (s.minItems && v.length < s.minItems) e.push(`${p} needs >= ${s.minItems} items`);\n" +
+      "    if (s.items) v.forEach((x, i) => checkSchema(x, s.items, `${p}[${i}]`, e));\n" +
+      "  } else if (t === 'string') {\n" +
+      "    if (typeof v !== 'string') return void e.push(`${p} must be a string`);\n" +
+      "    if (s.minLength && v.length < s.minLength) e.push(`${p} too short`);\n" +
+      "    if (s.enum && !s.enum.includes(v)) e.push(`${p} must be one of ${s.enum.join('|')} (got \"${v}\")`);\n" +
+      "    if (s.pattern && !new RegExp(s.pattern).test(v)) e.push(`${p} must match /${s.pattern}/`);\n" +
+      "  } else if (t === 'number') {\n" +
+      "    if (typeof v !== 'number' || Number.isNaN(v)) return void e.push(`${p} must be a number`);\n" +
+      "    if (s.min !== undefined && v < s.min) e.push(`${p} must be >= ${s.min}`);\n" +
+      "    if (s.max !== undefined && v > s.max) e.push(`${p} must be <= ${s.max}`);\n" +
+      "  } else if (t === 'boolean') { if (typeof v !== 'boolean') e.push(`${p} must be a boolean`); }\n" +
+      "  else e.push(`${p}: unknown schema type ${t}`);\n" +
+      "}\n" +
+      "function assertSchema(v, s, label) {\n" +
+      "  const e = []; checkSchema(v, s, '$', e);\n" +
+      "  if (e.length) throw new Error(`[${label}] schema mismatch (${e.length}): ${e.slice(0, 12).join('; ')}`);\n" +
+      "  return v;\n" +
+      "}\n" +
+      "const FILE_SCHEMA = { type: 'object', required: ['path', 'content'], props: { path: { type: 'string', minLength: 1 }, content: { type: 'string', minLength: 1 } } };\n" +
+      "function assertFiles(files, prefixes, label) {\n" +
+      "  for (const f of files) {\n" +
+      "    const p = f.path;\n" +
+      "    if (p.includes('..') || p.startsWith('/') || p.includes('\\\\') || !prefixes.some((x) => p.startsWith(x))) throw new Error(`[${label}] path not allowed: \"${p}\" (allowed: ${prefixes.join(', ')})`);\n" +
+      "    if (!p.endsWith('.ts')) throw new Error(`[${label}] only .ts files allowed: \"${p}\"`);\n" +
+      "    if (/waitForTimeout\\s*\\(|setTimeout\\s*\\(/.test(f.content)) throw new Error(`[${label}] hard sleep found in ${p}`);\n" +
+      "  }\n" +
+      "  return files;\n" +
+      "}\n" +
+      "// end shared helpers\n" +
+      "\n" +
+      "const ctx = $('Has Endpoints?').last().json;\n" +
+      "const key = ctx.ticket.key;\n" +
+      "const api = parseAgentJson($input.first().json.output, 'API Test Generator');\n" +
+      "assertSchema(api, {\n" +
+      "  type: 'object', required: ['files', 'endpoint_coverage'],\n" +
+      "  props: {\n" +
+      "    files: { type: 'array', minItems: 1, items: FILE_SCHEMA },\n" +
+      "    endpoint_coverage: { type: 'array', minItems: 1, items: { type: 'object', required: ['method', 'path', 'scenarios'], props: { scenarios: { type: 'array', minItems: 1, items: { type: 'string' } } } } },\n" +
+      "  },\n" +
+      "}, 'API Test Generator');\n" +
+      "assertFiles(api.files, [`tests/api/${key.toLowerCase()}/`, 'tests/fixtures/'], 'API Test Generator');\n" +
+      "return [{ json: { ...ctx, api } }];\n") } },
+  output: [{ ticket: { key: 'PROJ-101' }, design: { touches_db: false }, spec: { files: [] }, api: { files: [] } }]
+});
+
+const noApi = node({
+  type: 'n8n-nodes-base.code',
+  version: 2,
+  config: { name: 'No API Tests', parameters: { mode: 'runOnceForAllItems', jsCode: 'return [{ json: { ...$input.first().json, api: null } }];' } },
+  output: [{ ticket: { key: 'PROJ-101' }, design: { touches_db: false }, spec: { files: [] }, api: null }]
+});
+
+const touchesDb = ifElse({
+  version: 2.3,
+  config: {
+    name: 'Touches DB?',
+    parameters: {
+      conditions: {
+        options: { caseSensitive: true, leftValue: '', typeValidation: 'strict', version: 2 },
+        conditions: [{ leftValue: expr('{{ $json.design.touches_db }}'), rightValue: '', operator: { type: 'boolean', operation: 'true', singleValue: true } }],
+        combinator: 'and'
+      }
+    }
+  }
+});
+
+const dataModel = languageModel({
+  type: '@n8n/n8n-nodes-langchain.lmChatAnthropic',
+  version: 1.6,
+  config: {
+    name: 'Claude · Data (t=0.2)',
+    parameters: { model: { __rl: true, mode: 'id', value: 'claude-sonnet-5-5' }, options: { temperature: 0.2, maxTokensToSample: 8000 } },
+    credentials: { anthropicApi: newCredential('Anthropic (ANTHROPIC_API_KEY)') }
+  }
+});
+
+const dataAgent = node({
+  type: '@n8n/n8n-nodes-langchain.agent',
+  version: 3.1,
+  config: {
+    name: 'Data Checks Agent',
+    parameters: {
+      promptType: 'define',
+      text: expr('Generate read-only data-integrity checks for this ticket. Return STRICT JSON per the runtime contract.\n\nTICKET:\n{{ JSON.stringify($json.ticket, null, 2) }}\nMODULE: {{ $json.design.module }}\nDB ENTITIES: {{ JSON.stringify($json.design.db_entities) }}\n\nreview_feedback:\n{{ JSON.stringify($json.review_feedback, null, 2) }}'),
+      options: { systemMessage: ("<!-- Source skill: asadullahkhan-data-analyst (SKILL.md body, verbatim) + n8n runtime contract appended below. -->\n" +
+      "\n" +
+      "\n" +
+      "# Data Analyst\n" +
+      "\n" +
+      "SQL, data integrity, profiling, reconciliation. The output should be correct, performant, and explain *why* \u2014 not just hand over a query.\n" +
+      "\n" +
+      "## Core operating modes\n" +
+      "\n" +
+      "| Mode | Trigger | Primary output |\n" +
+      "|---|---|---|\n" +
+      "| **Query writing** | \"write a SQL query for X\" | SQL + explanation + test cases |\n" +
+      "| **Data validation** | \"validate this data\", \"integrity check\" | Validation script + integrity report |\n" +
+      "| **Schema analysis** | \"analyze this schema\", \"explain these tables\" | Schema summary + ERD + relationships |\n" +
+      "| **Data profiling** | \"profile this data\", \"what's in this table\" | Distributions, null counts, cardinality, anomalies |\n" +
+      "| **Reconciliation** | \"numbers don't match\", \"investigate discrepancy\" | Diagnostic queries + findings |\n" +
+      "| **Data quality monitoring** | \"set up DQ checks\", \"monitor for X\" | Ongoing check definitions + alerting strategy |\n" +
+      "\n" +
+      "## SQL writing discipline\n" +
+      "\n" +
+      "### Always provide\n" +
+      "- The query itself, formatted readably\n" +
+      "- A plain-English explanation of what it does\n" +
+      "- **Test cases** \u2014 sample input/output showing the query works\n" +
+      "- **Performance notes** \u2014 expected index usage, potential scan risk, estimated cost\n" +
+      "- **Caveats** \u2014 edge cases (NULLs, duplicates, time zones, etc.) the query handles or doesn't\n" +
+      "\n" +
+      "### Formatting standards\n" +
+      "```sql\n" +
+      "-- Readable, reviewable SQL\n" +
+      "SELECT\n" +
+      "    u.user_id,\n" +
+      "    u.email,\n" +
+      "    COUNT(o.order_id)        AS order_count,\n" +
+      "    SUM(o.total_amount)      AS lifetime_value,\n" +
+      "    MAX(o.created_at)        AS last_order_at\n" +
+      "FROM users u\n" +
+      "LEFT JOIN orders o\n" +
+      "    ON o.user_id = u.user_id\n" +
+      "    AND o.status = 'completed'\n" +
+      "WHERE u.created_at >= DATE '2025-01-01'\n" +
+      "  AND u.deleted_at IS NULL\n" +
+      "GROUP BY u.user_id, u.email\n" +
+      "HAVING COUNT(o.order_id) > 0\n" +
+      "ORDER BY lifetime_value DESC\n" +
+      "LIMIT 100;\n" +
+      "```\n" +
+      "\n" +
+      "Rules:\n" +
+      "- Keywords uppercase, identifiers lowercase\n" +
+      "- One clause per line for readability on anything non-trivial\n" +
+      "- Table aliases used consistently (`u` for users, `o` for orders)\n" +
+      "- JOINs explicit (never implicit `FROM a, b WHERE a.x = b.x`)\n" +
+      "- `LEFT JOIN` vs `INNER JOIN` is a deliberate choice \u2014 don't default\n" +
+      "- Always `ORDER BY` if you `LIMIT`\n" +
+      "- Column aliases for computed values\n" +
+      "- Comments for non-obvious logic\n" +
+      "\n" +
+      "### Dialect awareness\n" +
+      "\n" +
+      "Identify the dialect from context (PostgreSQL, MySQL, SQL Server, BigQuery, Snowflake, SQLite) and use dialect-specific features appropriately. If unclear, ask or default to ANSI SQL with a note.\n" +
+      "\n" +
+      "Common gotchas:\n" +
+      "- `LIMIT` (PostgreSQL/MySQL) vs `TOP` (SQL Server) vs `FETCH FIRST` (ANSI)\n" +
+      "- Window function support varies\n" +
+      "- Date/time functions are highly dialect-specific\n" +
+      "- String concatenation: `||`, `CONCAT()`, or `+`\n" +
+      "- `LATERAL` joins not in MySQL\n" +
+      "- `FILTER (WHERE ...)` in aggregates is PostgreSQL-specific\n" +
+      "\n" +
+      "## Data integrity validation playbook\n" +
+      "\n" +
+      "When asked to validate data integrity, systematically check:\n" +
+      "\n" +
+      "### Uniqueness\n" +
+      "```sql\n" +
+      "-- Detect duplicate primary keys\n" +
+      "SELECT user_id, COUNT(*) AS cnt\n" +
+      "FROM users\n" +
+      "GROUP BY user_id\n" +
+      "HAVING COUNT(*) > 1;\n" +
+      "\n" +
+      "-- Detect duplicate business keys\n" +
+      "SELECT email, COUNT(*) AS cnt\n" +
+      "FROM users\n" +
+      "WHERE deleted_at IS NULL\n" +
+      "GROUP BY email\n" +
+      "HAVING COUNT(*) > 1;\n" +
+      "```\n" +
+      "\n" +
+      "### Referential integrity\n" +
+      "```sql\n" +
+      "-- Orphaned foreign keys\n" +
+      "SELECT o.order_id, o.user_id\n" +
+      "FROM orders o\n" +
+      "LEFT JOIN users u ON u.user_id = o.user_id\n" +
+      "WHERE u.user_id IS NULL;\n" +
+      "```\n" +
+      "\n" +
+      "### Null / completeness\n" +
+      "```sql\n" +
+      "-- Nulls where they shouldn't be\n" +
+      "SELECT\n" +
+      "    COUNT(*)                                       AS total,\n" +
+      "    COUNT(*) FILTER (WHERE email IS NULL)          AS null_email,\n" +
+      "    COUNT(*) FILTER (WHERE created_at IS NULL)     AS null_created_at,\n" +
+      "    COUNT(*) FILTER (WHERE status IS NULL)         AS null_status\n" +
+      "FROM users;\n" +
+      "```\n" +
+      "\n" +
+      "### Range / domain validation\n" +
+      "```sql\n" +
+      "-- Values outside expected ranges\n" +
+      "SELECT order_id, total_amount, status\n" +
+      "FROM orders\n" +
+      "WHERE total_amount < 0\n" +
+      "   OR total_amount > 1000000\n" +
+      "   OR status NOT IN ('pending', 'completed', 'cancelled', 'refunded');\n" +
+      "```\n" +
+      "\n" +
+      "### Consistency across tables\n" +
+      "```sql\n" +
+      "-- User.order_count denormalized field matches actual count\n" +
+      "SELECT\n" +
+      "    u.user_id,\n" +
+      "    u.order_count AS stored,\n" +
+      "    COUNT(o.order_id) AS actual,\n" +
+      "    u.order_count - COUNT(o.order_id) AS diff\n" +
+      "FROM users u\n" +
+      "LEFT JOIN orders o ON o.user_id = u.user_id\n" +
+      "GROUP BY u.user_id, u.order_count\n" +
+      "HAVING u.order_count <> COUNT(o.order_id);\n" +
+      "```\n" +
+      "\n" +
+      "### Temporal consistency\n" +
+      "- `updated_at >= created_at`\n" +
+      "- `end_date >= start_date`\n" +
+      "- No future dates in \"historical\" fields\n" +
+      "- Event ordering makes sense (e.g., `shipped_at > paid_at > created_at`)\n" +
+      "\n" +
+      "### Cross-system reconciliation\n" +
+      "When comparing the same data across systems (e.g., database vs. data warehouse vs. reporting dashboard), check:\n" +
+      "- Row count matches\n" +
+      "- Sum of key metrics matches\n" +
+      "- Key-level matching (join both sources on PK, look for mismatches)\n" +
+      "- Timestamp-aware matching (account for replication lag)\n" +
+      "\n" +
+      "## Data profiling \u2014 standard output\n" +
+      "\n" +
+      "When profiling a table, produce this:\n" +
+      "\n" +
+      "```markdown\n" +
+      "## Table: <schema>.<table_name>\n" +
+      "\n" +
+      "### Metadata\n" +
+      "- Row count: <n>\n" +
+      "- Size: <MB/GB>\n" +
+      "- Last updated: <timestamp>\n" +
+      "\n" +
+      "### Columns\n" +
+      "| Column | Type | Nullable | % Null | Cardinality | Min | Max | Sample values |\n" +
+      "|---|---|---|---|---|---|---|---|\n" +
+      "| user_id | INT | No | 0% | 1,234,567 | 1 | 9,999,999 | 1, 42, 1337 |\n" +
+      "| email | VARCHAR | No | 0% | 1,234,502 | \u2014 | \u2014 | user@example.com |\n" +
+      "| status | VARCHAR | No | 0% | 4 | \u2014 | \u2014 | active, inactive, suspended, pending |\n" +
+      "\n" +
+      "### Anomalies detected\n" +
+      "- <Anything unusual: unexpected nulls, outliers, inconsistent formats, etc.>\n" +
+      "\n" +
+      "### Relationships\n" +
+      "- <Foreign keys out>\n" +
+      "- <Foreign keys in (referenced by)>\n" +
+      "\n" +
+      "### Suggested data quality checks\n" +
+      "- <Specific checks worth automating based on what was found>\n" +
+      "```\n" +
+      "\n" +
+      "## Python validation scripts (when SQL isn't enough)\n" +
+      "\n" +
+      "For complex validation, use Python with pandas or polars. Prefer polars for > 1M rows.\n" +
+      "\n" +
+      "```python\n" +
+      "import polars as pl\n" +
+      "from pathlib import Path\n" +
+      "\n" +
+      "def validate_orders_dataset(path: Path) -> dict:\n" +
+      "    \"\"\"\n" +
+      "    Validates the orders dataset against business rules.\n" +
+      "    Returns a report dict of check_name -> (passed: bool, details: str).\n" +
+      "    \"\"\"\n" +
+      "    df = pl.read_parquet(path)\n" +
+      "    report = {}\n" +
+      "\n" +
+      "    # Check 1: Unique order_id\n" +
+      "    dupes = df.group_by(\"order_id\").len().filter(pl.col(\"len\") > 1)\n" +
+      "    report[\"unique_order_id\"] = (\n" +
+      "        dupes.height == 0,\n" +
+      "        f\"{dupes.height} duplicate order_ids found\" if dupes.height else \"OK\",\n" +
+      "    )\n" +
+      "\n" +
+      "    # Check 2: Non-negative amounts\n" +
+      "    negatives = df.filter(pl.col(\"total_amount\") < 0)\n" +
+      "    report[\"non_negative_amounts\"] = (\n" +
+      "        negatives.height == 0,\n" +
+      "        f\"{negatives.height} rows with negative amount\" if negatives.height else \"OK\",\n" +
+      "    )\n" +
+      "\n" +
+      "    # Check 3: Status in allowed set\n" +
+      "    allowed = {\"pending\", \"completed\", \"cancelled\", \"refunded\"}\n" +
+      "    invalid = df.filter(~pl.col(\"status\").is_in(list(allowed)))\n" +
+      "    report[\"valid_status\"] = (\n" +
+      "        invalid.height == 0,\n" +
+      "        f\"{invalid.height} rows with invalid status\" if invalid.height else \"OK\",\n" +
+      "    )\n" +
+      "\n" +
+      "    # Check 4: Created_at not in the future\n" +
+      "    future = df.filter(pl.col(\"created_at\") > pl.lit(datetime.utcnow()))\n" +
+      "    report[\"no_future_timestamps\"] = (\n" +
+      "        future.height == 0,\n" +
+      "        f\"{future.height} rows with future created_at\" if future.height else \"OK\",\n" +
+      "    )\n" +
+      "\n" +
+      "    return report\n" +
+      "```\n" +
+      "\n" +
+      "## Performance / optimization guidance\n" +
+      "\n" +
+      "When writing or reviewing queries:\n" +
+      "\n" +
+      "- **Indexes**: name expected index use. If the query would full-scan a large table, flag it.\n" +
+      "- **Joins**: avoid cartesian accidents. Flag queries where cardinality assumptions are risky.\n" +
+      "- **Subqueries vs CTEs vs window functions**: use whichever makes the intent clearest; note performance trade-offs in specific dialects.\n" +
+      "- **`SELECT *`**: only when debugging. Name columns in production queries.\n" +
+      "- **`DISTINCT` as a duplicate-fix**: usually a smell. Fix the underlying duplication.\n" +
+      "- **`NOT IN` with nullable columns**: pitfall \u2014 flag and recommend `NOT EXISTS` or `LEFT JOIN ... IS NULL`.\n" +
+      "- **Functions on indexed columns** in WHERE: `WHERE UPPER(email) = ...` defeats the index. Flag.\n" +
+      "\n" +
+      "## Data quality monitoring\n" +
+      "\n" +
+      "For ongoing DQ checks, recommend:\n" +
+      "\n" +
+      "- **Frequency**: event-driven (after ETL), daily (for stable datasets), hourly (for real-time critical).\n" +
+      "- **Severity tiers**: critical (block the pipeline), warning (alert), info (log).\n" +
+      "- **Alerting**: where failures land (Slack channel, PagerDuty, email).\n" +
+      "- **Dashboards**: Grafana / Looker / Metabase with trendlines so you can see \"nulls rising over time\" not just \"nulls today\".\n" +
+      "- **Implementation**: dbt tests, Great Expectations, Soda, or custom SQL + scheduler.\n" +
+      "\n" +
+      "## SQA-specific applications\n" +
+      "\n" +
+      "This skill is heavily used for SQA test data and backend validation:\n" +
+      "\n" +
+      "### Test data integrity\n" +
+      "- Verify test data seeded correctly before test runs\n" +
+      "- Clean up test data in teardown (confirm it's gone, not just \"ran the cleanup\")\n" +
+      "- Detect test data leaks into non-test tables\n" +
+      "\n" +
+      "### ETL / pipeline verification\n" +
+      "- Source \u2192 target row count matches\n" +
+      "- Key metrics aggregate correctly after transformation\n" +
+      "- No null-amplification (source NULL should stay NULL, not become 0 or empty string)\n" +
+      "- Transformation logic preserves uniqueness and referential integrity\n" +
+      "\n" +
+      "### Report / dashboard reconciliation\n" +
+      "- The number on the report ties to the query\n" +
+      "- The query ties to the underlying data\n" +
+      "- Discrepancies trace to a specific ETL step or source system\n" +
+      "\n" +
+      "## MCP integrations\n" +
+      "\n" +
+      "- **Notion**: publish validation reports to a Notion database, one page per check or per run.\n" +
+      "- **Atlassian (Jira)**: create tickets when integrity checks fail, tagged by severity.\n" +
+      "- **Microsoft 365 (SharePoint)**: archive reports for audit/compliance.\n" +
+      "- **HubSpot / CodeNinja CRM**: for CRM data quality, validate records against business rules and flag cleanup needs.\n" +
+      "\n" +
+      "## Edge cases\n" +
+      "\n" +
+      "- **User provides a CSV**: read it, profile it, don't pretend to query a database that doesn't exist. Use pandas/polars in the code sandbox if analysis is needed.\n" +
+      "- **User provides a schema but no data**: write hypothetical queries with clear \"sample data assumed\" notes.\n" +
+      "- **Ambiguous question** (\"how many users?\"): ask for clarification on what defines a \"user\" (active, not-deleted, within time period).\n" +
+      "- **Cross-database query request**: flag that this usually requires federation (PostgreSQL FDW, Trino, etc.) or ETL.\n" +
+      "- **User reports \"numbers don't match\"**: systematic reconciliation \u2014 compare row counts, then per-key, then per-field. Don't jump to conclusions.\n" +
+      "- **Large result sets**: recommend pagination or summarization before returning. Never dump 10,000 rows inline.\n" +
+      "\n" +
+      "---\n" +
+      "\n" +
+      "# n8n Runtime Contract \u2014 Agent: Data Checks (overrides anything above that conflicts)\n" +
+      "\n" +
+      "Runs only when Test Design output has `touches_db=true`. Unattended; a Code node parses your reply.\n" +
+      "\n" +
+      "- Produce read-only data-integrity checks for the entities the ticket touches: uniqueness, referential integrity, null/completeness, domain/range, temporal consistency.\n" +
+      "- SQL must be **read-only** (`SELECT` / `WITH` only \u2014 never INSERT/UPDATE/DELETE/DDL). Default dialect PostgreSQL unless the ticket says otherwise; state it in `dialect`.\n" +
+      "- Emit them as a Playwright TS spec that runs each query through a `db` fixture (`tests/fixtures/db.ts`, using `pg` and `process.env.DATABASE_URL`) and asserts zero violating rows.\n" +
+      "- Allowed paths ONLY: `tests/data/<ticket-lowercase>/*.data.spec.ts`, `tests/fixtures/*.ts`.\n" +
+      "- Test titles carry `@data @<TICKET-KEY> @<module>`.\n" +
+      "- If `review_feedback` is present, fix every listed issue.\n" +
+      "\n" +
+      "## Output \u2014 STRICT JSON ONLY\n" +
+      "```json\n" +
+      "{\n" +
+      "  \"dialect\": \"postgresql\",\n" +
+      "  \"checks\": [{ \"name\": \"orders_no_orphan_user\", \"severity\": \"critical\", \"sql\": \"SELECT ...\" }],\n" +
+      "  \"files\": [{ \"path\": \"tests/data/proj-123/orders.data.spec.ts\", \"content\": \"...\" }]\n" +
+      "}\n" +
+      "```\n" +
+      "Allowed `severity`: critical|warning|info.\n"), maxIterations: 3 }
+    },
+    subnodes: { model: dataModel }
+  },
+  output: [{ output: '{"dialect":"postgresql","checks":[{"name":"no_orphans","severity":"critical","sql":"SELECT 1"}],"files":[{"path":"tests/data/proj-101/coupon.data.spec.ts","content":"// @data"}]}' }]
+});
+
+const validateData = node({
+  type: 'n8n-nodes-base.code',
+  version: 2,
+  config: { name: 'Validate Data JSON', parameters: { mode: 'runOnceForAllItems', jsCode: ("// shared strict-JSON helpers (prepended by n8n/build.py)\n" +
+      "function parseAgentJson(raw, label) {\n" +
+      "  if (raw && typeof raw === 'object') return raw;\n" +
+      "  if (typeof raw !== 'string' || !raw.trim()) throw new Error(`[${label}] empty/non-string agent output`);\n" +
+      "  let s = raw.trim();\n" +
+      "  const m = s.match(/^```(?:json)?\\s*([\\s\\S]*?)\\s*```$/i);\n" +
+      "  if (m) s = m[1].trim();\n" +
+      "  try { return JSON.parse(s); } catch (e) { throw new Error(`[${label}] invalid JSON (${e.message}): ${s.slice(0, 300)}`); }\n" +
+      "}\n" +
+      "// schema: {type:'object'|'array'|'string'|'number'|'boolean'|'any', required, props, items, minItems, enum, pattern, minLength, min, max, nullable}\n" +
+      "function checkSchema(v, s, p, e) {\n" +
+      "  if (v === null || v === undefined) { if (!(s.nullable && v === null)) e.push(`${p} is ${v === null ? 'null' : 'missing'}`); return; }\n" +
+      "  const t = s.type;\n" +
+      "  if (t === 'any') return;\n" +
+      "  if (t === 'object') {\n" +
+      "    if (typeof v !== 'object' || Array.isArray(v)) return void e.push(`${p} must be an object`);\n" +
+      "    (s.required || []).forEach((k) => { if (!(k in v)) e.push(`${p}.${k} is required`); });\n" +
+      "    Object.entries(s.props || {}).forEach(([k, sub]) => { if (k in v) checkSchema(v[k], sub, `${p}.${k}`, e); });\n" +
+      "  } else if (t === 'array') {\n" +
+      "    if (!Array.isArray(v)) return void e.push(`${p} must be an array`);\n" +
+      "    if (s.minItems && v.length < s.minItems) e.push(`${p} needs >= ${s.minItems} items`);\n" +
+      "    if (s.items) v.forEach((x, i) => checkSchema(x, s.items, `${p}[${i}]`, e));\n" +
+      "  } else if (t === 'string') {\n" +
+      "    if (typeof v !== 'string') return void e.push(`${p} must be a string`);\n" +
+      "    if (s.minLength && v.length < s.minLength) e.push(`${p} too short`);\n" +
+      "    if (s.enum && !s.enum.includes(v)) e.push(`${p} must be one of ${s.enum.join('|')} (got \"${v}\")`);\n" +
+      "    if (s.pattern && !new RegExp(s.pattern).test(v)) e.push(`${p} must match /${s.pattern}/`);\n" +
+      "  } else if (t === 'number') {\n" +
+      "    if (typeof v !== 'number' || Number.isNaN(v)) return void e.push(`${p} must be a number`);\n" +
+      "    if (s.min !== undefined && v < s.min) e.push(`${p} must be >= ${s.min}`);\n" +
+      "    if (s.max !== undefined && v > s.max) e.push(`${p} must be <= ${s.max}`);\n" +
+      "  } else if (t === 'boolean') { if (typeof v !== 'boolean') e.push(`${p} must be a boolean`); }\n" +
+      "  else e.push(`${p}: unknown schema type ${t}`);\n" +
+      "}\n" +
+      "function assertSchema(v, s, label) {\n" +
+      "  const e = []; checkSchema(v, s, '$', e);\n" +
+      "  if (e.length) throw new Error(`[${label}] schema mismatch (${e.length}): ${e.slice(0, 12).join('; ')}`);\n" +
+      "  return v;\n" +
+      "}\n" +
+      "const FILE_SCHEMA = { type: 'object', required: ['path', 'content'], props: { path: { type: 'string', minLength: 1 }, content: { type: 'string', minLength: 1 } } };\n" +
+      "function assertFiles(files, prefixes, label) {\n" +
+      "  for (const f of files) {\n" +
+      "    const p = f.path;\n" +
+      "    if (p.includes('..') || p.startsWith('/') || p.includes('\\\\') || !prefixes.some((x) => p.startsWith(x))) throw new Error(`[${label}] path not allowed: \"${p}\" (allowed: ${prefixes.join(', ')})`);\n" +
+      "    if (!p.endsWith('.ts')) throw new Error(`[${label}] only .ts files allowed: \"${p}\"`);\n" +
+      "    if (/waitForTimeout\\s*\\(|setTimeout\\s*\\(/.test(f.content)) throw new Error(`[${label}] hard sleep found in ${p}`);\n" +
+      "  }\n" +
+      "  return files;\n" +
+      "}\n" +
+      "// end shared helpers\n" +
+      "\n" +
+      "const ctx = $('Touches DB?').last().json;\n" +
+      "const key = ctx.ticket.key;\n" +
+      "const data = parseAgentJson($input.first().json.output, 'Data Checks');\n" +
+      "assertSchema(data, {\n" +
+      "  type: 'object', required: ['dialect', 'checks', 'files'],\n" +
+      "  props: {\n" +
+      "    dialect: { type: 'string' },\n" +
+      "    checks: { type: 'array', minItems: 1, items: { type: 'object', required: ['name', 'severity', 'sql'], props: { severity: { type: 'string', enum: ['critical', 'warning', 'info'] }, sql: { type: 'string' } } } },\n" +
+      "    files: { type: 'array', minItems: 1, items: FILE_SCHEMA },\n" +
+      "  },\n" +
+      "}, 'Data Checks');\n" +
+      "for (const c of data.checks) {\n" +
+      "  if (!/^\\s*(with|select)\\b/i.test(c.sql) || /\\b(insert|update|delete|drop|alter|truncate|create|grant|revoke|merge)\\b/i.test(c.sql)) {\n" +
+      "    throw new Error(`[Data Checks] check \"${c.name}\" is not read-only SQL`);\n" +
+      "  }\n" +
+      "}\n" +
+      "assertFiles(data.files, [`tests/data/${key.toLowerCase()}/`, 'tests/fixtures/'], 'Data Checks');\n" +
+      "return [{ json: { ...ctx, data } }];\n") } },
+  output: [{ ticket: { key: 'PROJ-101' }, spec: { files: [] }, api: null, data: { files: [] } }]
+});
+
+const noData = node({
+  type: 'n8n-nodes-base.code',
+  version: 2,
+  config: { name: 'No Data Checks', parameters: { mode: 'runOnceForAllItems', jsCode: 'return [{ json: { ...$input.first().json, data: null } }];' } },
+  output: [{ ticket: { key: 'PROJ-101' }, spec: { files: [] }, api: null, data: null }]
+});
+
+const assembleReview = node({
+  type: 'n8n-nodes-base.code',
+  version: 2,
+  config: { name: 'Assemble Review Bundle', parameters: { mode: 'runOnceForAllItems', jsCode: ("// Merge generated files (later sources win on identical paths) for the review gate.\n" +
+      "const ctx = $input.first().json;\n" +
+      "const byPath = new Map();\n" +
+      "for (const f of [...ctx.spec.files, ...(ctx.api?.files || []), ...(ctx.data?.files || [])]) byPath.set(f.path, f);\n" +
+      "const all_files = [...byPath.values()];\n" +
+      "return [{ json: { ...ctx, all_files } }];\n") } },
+  output: [{ ticket: { key: 'PROJ-101' }, design: { test_matrix: [] }, attempt: 0, all_files: [{ path: 'tests/e2e/proj-101/coupon.spec.ts', content: '// @PROJ-101' }] }]
+});
+
+const reviewModel = languageModel({
+  type: '@n8n/n8n-nodes-langchain.lmChatAnthropic',
+  version: 1.6,
+  config: {
+    name: 'Claude · Review (t=0)',
+    parameters: { model: { __rl: true, mode: 'id', value: 'claude-sonnet-5-5' }, options: { temperature: 0, maxTokensToSample: 8000 } },
+    credentials: { anthropicApi: newCredential('Anthropic (ANTHROPIC_API_KEY)') }
+  }
+});
+
+const reviewAgent = node({
+  type: '@n8n/n8n-nodes-langchain.agent',
+  version: 3.1,
+  config: {
+    name: 'Code Review Agent',
+    parameters: {
+      promptType: 'define',
+      text: expr('Review this generated test code as the merge gate. Return STRICT JSON per the runtime contract.\n\nTICKET: {{ $json.ticket.key }} — {{ $json.ticket.summary }}\nMODULE TAG: @{{ $json.design.module }}\n\nTEST MATRIX (every row needs a spec):\n{{ JSON.stringify($json.design.test_matrix, null, 2) }}\n\nFILES:\n{{ $json.all_files.map(f => "=== " + f.path + " ===\\n" + f.content).join("\\n\\n") }}'),
+      options: { systemMessage: ("<!-- Source skill: asadullahkhan-code-review (SKILL.md body, verbatim) + n8n runtime contract appended below. -->\n" +
+      "\n" +
+      "\n" +
+      "# Code Review\n" +
+      "\n" +
+      "Deliver honest, senior-level code review. The goal is not to be nice \u2014 it is to make the code better and teach the author why.\n" +
+      "\n" +
+      "## Core review philosophy\n" +
+      "\n" +
+      "Be opinionated. Flag bad practices by name. Explain the *why* behind every critique so the author learns the principle, not just the fix. Prioritize issues that matter: correctness > security > testability > performance > style. Do not bury critical bugs under nitpicks.\n" +
+      "\n" +
+      "## Review output structure\n" +
+      "\n" +
+      "Always produce this exact structure, in this order:\n" +
+      "\n" +
+      "### 1. Verdict\n" +
+      "One line: `APPROVE`, `APPROVE WITH COMMENTS`, `REQUEST CHANGES`, or `BLOCK \u2014 DO NOT MERGE`. Follow with a 1-2 sentence summary of the overall state.\n" +
+      "\n" +
+      "### 2. Critical issues (bugs, security, data loss)\n" +
+      "Numbered list. For each: file/line reference \u2192 problem \u2192 why it matters \u2192 concrete fix. Skip this section only if there genuinely are none.\n" +
+      "\n" +
+      "### 3. Design & architecture concerns\n" +
+      "Coupling, cohesion, abstraction leaks, missing error boundaries, violation of single responsibility, hidden side effects, untestable constructs, concurrency hazards.\n" +
+      "\n" +
+      "### 4. Clean code violations\n" +
+      "Name the principle violated (DRY, SOLID, YAGNI, KISS, Law of Demeter, etc.). Point to the exact offending construct. Suggest the refactor.\n" +
+      "\n" +
+      "### 5. Test coverage gaps\n" +
+      "What's untested? What edge cases are missing? Are the existing tests actually meaningful, or are they asserting trivially true things? Flag mocks that mock the thing under test.\n" +
+      "\n" +
+      "### 6. Nits (style, naming, minor)\n" +
+      "Batched at the end so they don't drown the important stuff. Label as nits explicitly.\n" +
+      "\n" +
+      "### 7. What's good\n" +
+      "Acknowledge solid patterns, clever solutions, or good test hygiene. Keeps feedback balanced and reinforces what to keep doing.\n" +
+      "\n" +
+      "## Language-specific review lenses\n" +
+      "\n" +
+      "### Python\n" +
+      "- Type hints present and correct? `Any` used as a cop-out?\n" +
+      "- Pydantic models vs. raw dicts for structured data?\n" +
+      "- Exception handling: bare `except:` is a bug, `except Exception:` usually is too\n" +
+      "- Context managers for resources \u2014 `with` vs. manual close\n" +
+      "- Mutable default arguments (`def f(x=[])`) \u2014 always a bug\n" +
+      "- f-strings over `%` or `.format()`\n" +
+      "- `pathlib.Path` over `os.path`\n" +
+      "- Async: `asyncio.gather` vs. sequential awaits when parallelism is safe\n" +
+      "\n" +
+      "### TypeScript / JavaScript\n" +
+      "- `any` usage \u2014 demand justification or `unknown` instead\n" +
+      "- Strict mode enabled? `noImplicitAny`, `strictNullChecks`?\n" +
+      "- Promise handling: missing `await`, unhandled rejections, `.catch(() => {})` swallowing errors\n" +
+      "- `==` vs `===`\n" +
+      "- Mutation of function arguments\n" +
+      "- React: hook dependency arrays, key props on lists, effect cleanup\n" +
+      "- Node: proper stream handling, back-pressure\n" +
+      "\n" +
+      "### Java\n" +
+      "- Checked vs. unchecked exceptions \u2014 is the choice deliberate?\n" +
+      "- Generics: raw types, unbounded wildcards where bounded would be safer\n" +
+      "- `Optional` misuse (fields, parameters \u2014 should be return types only)\n" +
+      "- Resource leaks: try-with-resources used?\n" +
+      "- Thread safety: shared mutable state without synchronization\n" +
+      "- JUnit version, assertion library consistency\n" +
+      "\n" +
+      "### C#\n" +
+      "- Null-coalescing (`??`, `??=`) and null-conditional (`?.`) operators used where appropriate?\n" +
+      "- `async void` outside event handlers \u2014 always a bug\n" +
+      "- `ConfigureAwait(false)` in library code\n" +
+      "- LINQ clarity vs. over-chaining\n" +
+      "- `IDisposable` properly implemented, `using` declarations\n" +
+      "- Records vs. classes for DTOs\n" +
+      "\n" +
+      "## Test code review (special case)\n" +
+      "\n" +
+      "When reviewing test code (Pytest, Jest, Playwright, Selenium, JUnit, etc.), apply extra scrutiny:\n" +
+      "\n" +
+      "- **Is the test actually testing something?** Assertions like `assert result is not None` on something that can never be None are noise.\n" +
+      "- **Selector strategy**: in UI tests, flag XPath and brittle CSS. Enforce priority: `data-testid` > `aria-role` > CSS > XPath.\n" +
+      "- **Explicit waits over sleeps**: `time.sleep()` and `Thread.sleep()` in tests are a blocking issue.\n" +
+      "- **Test isolation**: shared state between tests, order-dependent tests, missing fixtures/teardown.\n" +
+      "- **Page Object Model**: is it used, or is DOM interaction scattered through tests?\n" +
+      "- **Test data management**: hardcoded IDs, environment-specific data, missing cleanup.\n" +
+      "- **Flakiness signals**: retries masking real bugs, timing-dependent assertions.\n" +
+      "\n" +
+      "## Agentic / automation code review\n" +
+      "\n" +
+      "When reviewing UiPath workflows, LangGraph graphs, CrewAI agents, or similar:\n" +
+      "\n" +
+      "- Exception handling: `BusinessRuleException` vs. `SystemException` separation (UiPath)\n" +
+      "- State schema defined explicitly (LangGraph)\n" +
+      "- Retry policies and idempotency\n" +
+      "- Guardrails and human-in-the-loop hooks for high-risk actions\n" +
+      "- Confidence thresholds for classification agents\n" +
+      "- Queue/dispatcher separation for high-volume workflows\n" +
+      "- Hardcoded config vs. assets/environment variables\n" +
+      "\n" +
+      "## Security review lens (always apply)\n" +
+      "\n" +
+      "- Injection: SQL, command, LDAP, XPath, template\n" +
+      "- Secrets: hardcoded credentials, API keys, tokens in source or logs\n" +
+      "- Input validation and output encoding\n" +
+      "- Authentication and authorization checks on every protected path\n" +
+      "- Deserialization of untrusted data\n" +
+      "- Path traversal, SSRF, open redirects\n" +
+      "- Dependency vulnerabilities (flag outdated/known-CVE packages if visible)\n" +
+      "- Logging sensitive data (PII, tokens, passwords)\n" +
+      "\n" +
+      "## Tone\n" +
+      "\n" +
+      "Direct but not cruel. \"This is broken because X, fix it with Y\" is fine. \"This is terrible\" is not. Assume the author is competent and busy \u2014 give them what they need to ship a better version, fast.\n" +
+      "\n" +
+      "When the user is in learning mode (signaled by beginner-level code, explicit asks like \"I'm learning\", or the `[MENTOR]` flag), soften the tone, explain the principles more deeply, and include one interview question related to the issue found.\n" +
+      "\n" +
+      "## Edge cases\n" +
+      "\n" +
+      "- **No code provided, just a description**: ask for the code. Don't review vibes.\n" +
+      "- **Partial file**: note that review is limited to what was shown and call out what you'd need to see to be thorough (e.g., the caller, the test file, the type definitions).\n" +
+      "- **Generated code (scaffolding, migrations)**: review more lightly on style, heavily on anything that's been hand-edited.\n" +
+      "- **Legacy code with a specific change request**: scope the review to the change unless asked otherwise. Don't demand a full rewrite of something the user isn't touching.\n" +
+      "\n" +
+      "---\n" +
+      "\n" +
+      "# n8n Runtime Contract \u2014 Agent: Test Code Review gate (overrides anything above that conflicts)\n" +
+      "\n" +
+      "You are the quality gate between generated tests and a pull request. Unattended; a Code node parses your reply. Apply the \"Test code review\" lens with maximum strictness, plus the security lens.\n" +
+      "\n" +
+      "Blocking (\u2192 `CHANGES`) if ANY of: sleeps/`waitForTimeout`; XPath or brittle CSS where a test id/role exists; no POM; missing tags (`@<KEY>`, `@<module>`, `@smoke|@regression|@api|@data`); trivially-true assertions; order-dependent tests; hard-coded secrets/hosts; file paths outside `tests/`; TypeScript that will not compile; write SQL in data checks; any acceptance-criterion row in the matrix with no spec.\n" +
+      "\n" +
+      "Verdict mapping from the skill: `APPROVE` and `APPROVE WITH COMMENTS` \u2192 `\"APPROVE\"`; `REQUEST CHANGES` and `BLOCK \u2014 DO NOT MERGE` \u2192 `\"CHANGES\"`.\n" +
+      "\n" +
+      "## Output \u2014 STRICT JSON ONLY\n" +
+      "```json\n" +
+      "{\n" +
+      "  \"verdict\": \"APPROVE\",\n" +
+      "  \"summary\": \"1-2 sentences\",\n" +
+      "  \"issues\": [{ \"severity\": \"critical\", \"file\": \"tests/e2e/proj-123/checkout.spec.ts\", \"line\": 42, \"problem\": \"...\", \"fix\": \"...\" }],\n" +
+      "  \"good\": [\"...\"]\n" +
+      "}\n" +
+      "```\n" +
+      "Allowed `verdict`: APPROVE|CHANGES. Allowed `severity`: critical|major|minor|nit. `line` may be null. If verdict is CHANGES, `issues` must contain \u22651 critical or major item.\n"), maxIterations: 3 }
+    },
+    subnodes: { model: reviewModel }
+  },
+  output: [{ output: '{"verdict":"APPROVE","summary":"Solid POM usage.","issues":[],"good":["web-first assertions"]}' }]
+});
+
+const validateReview = node({
+  type: 'n8n-nodes-base.code',
+  version: 2,
+  config: { name: 'Validate Review JSON', parameters: { mode: 'runOnceForAllItems', jsCode: ("// shared strict-JSON helpers (prepended by n8n/build.py)\n" +
+      "function parseAgentJson(raw, label) {\n" +
+      "  if (raw && typeof raw === 'object') return raw;\n" +
+      "  if (typeof raw !== 'string' || !raw.trim()) throw new Error(`[${label}] empty/non-string agent output`);\n" +
+      "  let s = raw.trim();\n" +
+      "  const m = s.match(/^```(?:json)?\\s*([\\s\\S]*?)\\s*```$/i);\n" +
+      "  if (m) s = m[1].trim();\n" +
+      "  try { return JSON.parse(s); } catch (e) { throw new Error(`[${label}] invalid JSON (${e.message}): ${s.slice(0, 300)}`); }\n" +
+      "}\n" +
+      "// schema: {type:'object'|'array'|'string'|'number'|'boolean'|'any', required, props, items, minItems, enum, pattern, minLength, min, max, nullable}\n" +
+      "function checkSchema(v, s, p, e) {\n" +
+      "  if (v === null || v === undefined) { if (!(s.nullable && v === null)) e.push(`${p} is ${v === null ? 'null' : 'missing'}`); return; }\n" +
+      "  const t = s.type;\n" +
+      "  if (t === 'any') return;\n" +
+      "  if (t === 'object') {\n" +
+      "    if (typeof v !== 'object' || Array.isArray(v)) return void e.push(`${p} must be an object`);\n" +
+      "    (s.required || []).forEach((k) => { if (!(k in v)) e.push(`${p}.${k} is required`); });\n" +
+      "    Object.entries(s.props || {}).forEach(([k, sub]) => { if (k in v) checkSchema(v[k], sub, `${p}.${k}`, e); });\n" +
+      "  } else if (t === 'array') {\n" +
+      "    if (!Array.isArray(v)) return void e.push(`${p} must be an array`);\n" +
+      "    if (s.minItems && v.length < s.minItems) e.push(`${p} needs >= ${s.minItems} items`);\n" +
+      "    if (s.items) v.forEach((x, i) => checkSchema(x, s.items, `${p}[${i}]`, e));\n" +
+      "  } else if (t === 'string') {\n" +
+      "    if (typeof v !== 'string') return void e.push(`${p} must be a string`);\n" +
+      "    if (s.minLength && v.length < s.minLength) e.push(`${p} too short`);\n" +
+      "    if (s.enum && !s.enum.includes(v)) e.push(`${p} must be one of ${s.enum.join('|')} (got \"${v}\")`);\n" +
+      "    if (s.pattern && !new RegExp(s.pattern).test(v)) e.push(`${p} must match /${s.pattern}/`);\n" +
+      "  } else if (t === 'number') {\n" +
+      "    if (typeof v !== 'number' || Number.isNaN(v)) return void e.push(`${p} must be a number`);\n" +
+      "    if (s.min !== undefined && v < s.min) e.push(`${p} must be >= ${s.min}`);\n" +
+      "    if (s.max !== undefined && v > s.max) e.push(`${p} must be <= ${s.max}`);\n" +
+      "  } else if (t === 'boolean') { if (typeof v !== 'boolean') e.push(`${p} must be a boolean`); }\n" +
+      "  else e.push(`${p}: unknown schema type ${t}`);\n" +
+      "}\n" +
+      "function assertSchema(v, s, label) {\n" +
+      "  const e = []; checkSchema(v, s, '$', e);\n" +
+      "  if (e.length) throw new Error(`[${label}] schema mismatch (${e.length}): ${e.slice(0, 12).join('; ')}`);\n" +
+      "  return v;\n" +
+      "}\n" +
+      "const FILE_SCHEMA = { type: 'object', required: ['path', 'content'], props: { path: { type: 'string', minLength: 1 }, content: { type: 'string', minLength: 1 } } };\n" +
+      "function assertFiles(files, prefixes, label) {\n" +
+      "  for (const f of files) {\n" +
+      "    const p = f.path;\n" +
+      "    if (p.includes('..') || p.startsWith('/') || p.includes('\\\\') || !prefixes.some((x) => p.startsWith(x))) throw new Error(`[${label}] path not allowed: \"${p}\" (allowed: ${prefixes.join(', ')})`);\n" +
+      "    if (!p.endsWith('.ts')) throw new Error(`[${label}] only .ts files allowed: \"${p}\"`);\n" +
+      "    if (/waitForTimeout\\s*\\(|setTimeout\\s*\\(/.test(f.content)) throw new Error(`[${label}] hard sleep found in ${p}`);\n" +
+      "  }\n" +
+      "  return files;\n" +
+      "}\n" +
+      "// end shared helpers\n" +
+      "\n" +
+      "const ctx = $('Assemble Review Bundle').last().json;\n" +
+      "const review = parseAgentJson($input.first().json.output, 'Code Review');\n" +
+      "assertSchema(review, {\n" +
+      "  type: 'object', required: ['verdict', 'summary', 'issues'],\n" +
+      "  props: {\n" +
+      "    verdict: { type: 'string', enum: ['APPROVE', 'CHANGES'] },\n" +
+      "    summary: { type: 'string', minLength: 1 },\n" +
+      "    issues: { type: 'array', items: { type: 'object', required: ['severity', 'problem'], props: { severity: { type: 'string', enum: ['critical', 'major', 'minor', 'nit'] }, problem: { type: 'string' } } } },\n" +
+      "    good: { type: 'array', items: { type: 'string' } },\n" +
+      "  },\n" +
+      "}, 'Code Review');\n" +
+      "if (review.verdict === 'CHANGES' && !review.issues.some((i) => ['critical', 'major'].includes(i.severity))) {\n" +
+      "  throw new Error('[Code Review] verdict CHANGES requires at least one critical/major issue');\n" +
+      "}\n" +
+      "const MAX_REVISIONS = 2;\n" +
+      "return [{ json: { ...ctx, review, can_retry: review.verdict === 'CHANGES' && ctx.attempt < MAX_REVISIONS } }];\n") } },
+  output: [{ ticket: { key: 'PROJ-101' }, attempt: 0, review: { verdict: 'APPROVE', summary: 'ok', issues: [] }, can_retry: false }]
+});
+
+const reviseSpecs = ifElse({
+  version: 2.3,
+  config: {
+    name: 'Changes Requested & Retries Left?',
+    parameters: {
+      conditions: {
+        options: { caseSensitive: true, leftValue: '', typeValidation: 'strict', version: 2 },
+        conditions: [{ leftValue: expr('{{ $json.can_retry }}'), rightValue: '', operator: { type: 'boolean', operation: 'true', singleValue: true } }],
+        combinator: 'and'
+      }
+    }
+  }
+});
+
+const prepareRevision = node({
+  type: 'n8n-nodes-base.code',
+  version: 2,
+  config: { name: 'Prepare Spec Revision', parameters: { mode: 'runOnceForAllItems', jsCode: ("const ctx = $input.first().json;\n" +
+      "return [{\n" +
+      "  json: {\n" +
+      "    ticket: ctx.ticket,\n" +
+      "    design: ctx.design,\n" +
+      "    attempt: ctx.attempt + 1,\n" +
+      "    review_feedback: ctx.review.issues.filter((i) => i.severity !== 'nit'),\n" +
+      "  },\n" +
+      "}];\n") } },
+  output: [{ ticket: { key: 'PROJ-101' }, design: {}, attempt: 1, review_feedback: [{ severity: 'major', problem: 'missing tag' }] }]
+});
+
+const buildPr = node({
+  type: 'n8n-nodes-base.code',
+  version: 2,
+  config: { name: 'Build PR Payload', parameters: { mode: 'runOnceForAllItems', jsCode: ("const ctx = $input.first().json;\n" +
+      "const cfg = $('Config').first().json;\n" +
+      "const key = ctx.ticket.key;\n" +
+      "const branch = `qa/${key}`;\n" +
+      "const dispatch_id = `${key}-${$execution.id}-${Date.now()}`;\n" +
+      "const cell = (v) => String(v ?? '').replace(/\\|/g, '\\\\|').replace(/\\r?\\n/g, '<br>');\n" +
+      "const matrix = [\n" +
+      "  '| ID | Title | Priority | Type | Expected | Tags |',\n" +
+      "  '|---|---|---|---|---|---|',\n" +
+      "  ...ctx.design.test_matrix.map((r) => `| ${cell(r.id)} | ${cell(r.title)} | ${cell(r.priority)} | ${cell(r.type)} | ${cell(r.expected)} | ${cell((r.tags || []).join(' '))} |`),\n" +
+      "].join('\\n');\n" +
+      "const verdict = ctx.review.verdict;\n" +
+      "const issues = ctx.review.issues.length\n" +
+      "  ? ctx.review.issues.map((i) => `- **${i.severity}** ${i.file ? '`' + i.file + (i.line ? ':' + i.line : '') + '`' : ''} ${i.problem}${i.fix ? ' \u2192 ' + i.fix : ''}`).join('\\n')\n" +
+      "  : '_none_';\n" +
+      "const warn = verdict === 'CHANGES'\n" +
+      "  ? `> [!WARNING]\\n> Review gate still returned **CHANGES** after ${ctx.attempt} revision(s). Human attention required before this PR is used.\\n\\n`\n" +
+      "  : '';\n" +
+      "const body = `${warn}## ${key} \u2014 ${ctx.ticket.summary}\\n\\nJira: ${ctx.ticket.url}\\nModule: \\`@${ctx.design.module}\\` \u00b7 Grep: \\`${ctx.spec.grep}\\`\\n\\n` +\n" +
+      "  `### Test matrix\\n${matrix}\\n\\n` +\n" +
+      "  `### Review verdict: \\`${verdict}\\` (revisions: ${ctx.attempt})\\n${ctx.review.summary}\\n\\n${issues}\\n\\n` +\n" +
+      "  `### Files\\n${ctx.all_files.map((f) => '- `' + f.path + '`').join('\\n')}\\n\\n` +\n" +
+      "  (ctx.design.assumptions.length ? `### Assumptions\\n${ctx.design.assumptions.map((a) => '- ' + a).join('\\n')}\\n\\n` : '') +\n" +
+      "  `---\\nGenerated by n8n **QA | Design & Automate** (execution ${$execution.id}). Never auto-merged \u2014 a human approves and merges.`;\n" +
+      "return [{\n" +
+      "  json: {\n" +
+      "    ...ctx,\n" +
+      "    branch,\n" +
+      "    dispatch_id,\n" +
+      "    grep: ctx.spec.grep,\n" +
+      "    commit_message: `test(${key}): add generated Playwright tests\\n\\nReview verdict: ${verdict}\\nSource: n8n execution ${$execution.id}`,\n" +
+      "    pr_title: `[QA] ${key}: automated tests \u2014 ${ctx.ticket.summary}`.slice(0, 250),\n" +
+      "    pr_body: body,\n" +
+      "    tree: ctx.all_files.map((f) => ({ path: f.path, mode: '100644', type: 'blob', content: f.content })),\n" +
+      "    pr_draft: cfg.PR_DRAFT === true || cfg.PR_DRAFT === 'true',\n" +
+      "  },\n" +
+      "}];\n") } },
+  output: [{ ticket: { key: 'PROJ-101', summary: 'Apply coupon at checkout', url: 'https://example.atlassian.net/browse/PROJ-101' }, design: { module: 'checkout' }, review: { verdict: 'APPROVE' }, branch: 'qa/PROJ-101', dispatch_id: 'PROJ-101-1-1700000000000', grep: '@PROJ-101', commit_message: 'test(PROJ-101): add generated Playwright tests', pr_title: '[QA] PROJ-101: automated tests', pr_body: '## PROJ-101', tree: [{ path: 'tests/e2e/proj-101/coupon.spec.ts', mode: '100644', type: 'blob', content: '// x' }], pr_draft: true }]
+});
+
+const getBaseBranch = node({
+  type: 'n8n-nodes-base.httpRequest',
+  version: 4.5,
+  config: {
+    name: 'GitHub · Get Base Branch',
+    retryOnFail: true,
+    maxTries: 3,
+    waitBetweenTries: 5000,
+    parameters: {
+      method: 'GET',
+      url: expr('https://api.github.com/repos/{{ $("Config").first().json.GITHUB_OWNER }}/{{ $("Config").first().json.GITHUB_REPO }}/branches/{{ $("Config").first().json.BASE_BRANCH }}'),
+      authentication: 'predefinedCredentialType',
+      nodeCredentialType: 'githubApi',
+      sendHeaders: true,
+      specifyHeaders: 'keypair',
+      headerParameters: { parameters: [{ name: 'Accept', value: 'application/vnd.github+json' }, { name: 'X-GitHub-Api-Version', value: '2022-11-28' }] },
+      options: { timeout: 60000 },
+    },
+    credentials: { githubApi: newCredential('GitHub (GITHUB_TOKEN)') }
+  },
+  output: [{ name: 'main', commit: { sha: 'aaa111', commit: { tree: { sha: 'tree111' } } } }]
+});
+
+const createTree = node({
+  type: 'n8n-nodes-base.httpRequest',
+  version: 4.5,
+  config: {
+    name: 'GitHub · Create Tree',
+    retryOnFail: true,
+    maxTries: 3,
+    waitBetweenTries: 5000,
+    parameters: {
+      method: 'POST',
+      url: expr('https://api.github.com/repos/{{ $("Config").first().json.GITHUB_OWNER }}/{{ $("Config").first().json.GITHUB_REPO }}/git/trees'),
+      authentication: 'predefinedCredentialType',
+      nodeCredentialType: 'githubApi',
+      sendHeaders: true,
+      specifyHeaders: 'keypair',
+      headerParameters: { parameters: [{ name: 'Accept', value: 'application/vnd.github+json' }, { name: 'X-GitHub-Api-Version', value: '2022-11-28' }] },
+      options: { timeout: 60000 },
+      sendBody: true,
+      contentType: 'json',
+      specifyBody: 'json',
+      jsonBody: expr('{{ JSON.stringify({ base_tree: $json.commit.commit.tree.sha, tree: $("Build PR Payload").last().json.tree }) }}')
+    },
+    credentials: { githubApi: newCredential('GitHub (GITHUB_TOKEN)') }
+  },
+  output: [{ sha: 'tree222' }]
+});
+
+const createCommit = node({
+  type: 'n8n-nodes-base.httpRequest',
+  version: 4.5,
+  config: {
+    name: 'GitHub · Create Commit',
+    retryOnFail: true,
+    maxTries: 3,
+    waitBetweenTries: 5000,
+    parameters: {
+      method: 'POST',
+      url: expr('https://api.github.com/repos/{{ $("Config").first().json.GITHUB_OWNER }}/{{ $("Config").first().json.GITHUB_REPO }}/git/commits'),
+      authentication: 'predefinedCredentialType',
+      nodeCredentialType: 'githubApi',
+      sendHeaders: true,
+      specifyHeaders: 'keypair',
+      headerParameters: { parameters: [{ name: 'Accept', value: 'application/vnd.github+json' }, { name: 'X-GitHub-Api-Version', value: '2022-11-28' }] },
+      options: { timeout: 60000 },
+      sendBody: true,
+      contentType: 'json',
+      specifyBody: 'json',
+      jsonBody: expr('{{ JSON.stringify({ message: $("Build PR Payload").last().json.commit_message, tree: $json.sha, parents: [$("GitHub · Get Base Branch").last().json.commit.sha] }) }}')
+    },
+    credentials: { githubApi: newCredential('GitHub (GITHUB_TOKEN)') }
+  },
+  output: [{ sha: 'commit333' }]
+});
+
+const createBranch = node({
+  type: 'n8n-nodes-base.httpRequest',
+  version: 4.5,
+  config: {
+    name: 'GitHub · Create Branch qa/KEY',
+    onError: 'continueErrorOutput',
+    retryOnFail: true,
+    maxTries: 3,
+    waitBetweenTries: 5000,
+    parameters: {
+      method: 'POST',
+      url: expr('https://api.github.com/repos/{{ $("Config").first().json.GITHUB_OWNER }}/{{ $("Config").first().json.GITHUB_REPO }}/git/refs'),
+      authentication: 'predefinedCredentialType',
+      nodeCredentialType: 'githubApi',
+      sendHeaders: true,
+      specifyHeaders: 'keypair',
+      headerParameters: { parameters: [{ name: 'Accept', value: 'application/vnd.github+json' }, { name: 'X-GitHub-Api-Version', value: '2022-11-28' }] },
+      options: { timeout: 60000 },
+      sendBody: true,
+      contentType: 'json',
+      specifyBody: 'json',
+      jsonBody: expr('{{ JSON.stringify({ ref: "refs/heads/" + $("Build PR Payload").last().json.branch, sha: $json.sha }) }}')
+    },
+    credentials: { githubApi: newCredential('GitHub (GITHUB_TOKEN)') }
+  },
+  output: [{ ref: 'refs/heads/qa/PROJ-101', object: { sha: 'commit333' } }]
+});
+
+const forceUpdateBranch = node({
+  type: 'n8n-nodes-base.httpRequest',
+  version: 4.5,
+  config: {
+    name: 'GitHub · Update Existing qa/KEY Branch',
+    retryOnFail: true,
+    maxTries: 3,
+    waitBetweenTries: 5000,
+    parameters: {
+      method: 'PATCH',
+      url: expr('https://api.github.com/repos/{{ $("Config").first().json.GITHUB_OWNER }}/{{ $("Config").first().json.GITHUB_REPO }}/git/refs/heads/{{ $("Build PR Payload").last().json.branch }}'),
+      authentication: 'predefinedCredentialType',
+      nodeCredentialType: 'githubApi',
+      sendHeaders: true,
+      specifyHeaders: 'keypair',
+      headerParameters: { parameters: [{ name: 'Accept', value: 'application/vnd.github+json' }, { name: 'X-GitHub-Api-Version', value: '2022-11-28' }] },
+      options: { timeout: 60000 },
+      sendBody: true,
+      contentType: 'json',
+      specifyBody: 'json',
+      jsonBody: expr('{{ JSON.stringify({ sha: $("GitHub · Create Commit").last().json.sha, force: true }) }}')
+    },
+    credentials: { githubApi: newCredential('GitHub (GITHUB_TOKEN)') }
+  },
+  output: [{ ref: 'refs/heads/qa/PROJ-101', object: { sha: 'commit333' } }]
+});
+
+const openPr = node({
+  type: 'n8n-nodes-base.httpRequest',
+  version: 4.5,
+  config: {
+    name: 'GitHub · Open Pull Request',
+    onError: 'continueErrorOutput',
+    retryOnFail: true,
+    maxTries: 3,
+    waitBetweenTries: 5000,
+    parameters: {
+      method: 'POST',
+      url: expr('https://api.github.com/repos/{{ $("Config").first().json.GITHUB_OWNER }}/{{ $("Config").first().json.GITHUB_REPO }}/pulls'),
+      authentication: 'predefinedCredentialType',
+      nodeCredentialType: 'githubApi',
+      sendHeaders: true,
+      specifyHeaders: 'keypair',
+      headerParameters: { parameters: [{ name: 'Accept', value: 'application/vnd.github+json' }, { name: 'X-GitHub-Api-Version', value: '2022-11-28' }] },
+      options: { timeout: 60000 },
+      sendBody: true,
+      contentType: 'json',
+      specifyBody: 'json',
+      jsonBody: expr('{{ JSON.stringify({ title: $("Build PR Payload").last().json.pr_title, head: $("Build PR Payload").last().json.branch, base: $("Config").first().json.BASE_BRANCH, body: $("Build PR Payload").last().json.pr_body, draft: $("Build PR Payload").last().json.pr_draft, maintainer_can_modify: true }) }}')
+    },
+    credentials: { githubApi: newCredential('GitHub (GITHUB_TOKEN)') }
+  },
+  output: [{ number: 42, html_url: 'https://github.com/acme/webapp/pull/42' }]
+});
+
+const findExistingPr = node({
+  type: 'n8n-nodes-base.httpRequest',
+  version: 4.5,
+  config: {
+    name: 'GitHub · Find Existing PR',
+    retryOnFail: true,
+    maxTries: 3,
+    waitBetweenTries: 5000,
+    parameters: {
+      method: 'GET',
+      url: expr('https://api.github.com/repos/{{ $("Config").first().json.GITHUB_OWNER }}/{{ $("Config").first().json.GITHUB_REPO }}/pulls?state=open&head={{ $("Config").first().json.GITHUB_OWNER }}:{{ encodeURIComponent($("Build PR Payload").last().json.branch) }}'),
+      authentication: 'predefinedCredentialType',
+      nodeCredentialType: 'githubApi',
+      sendHeaders: true,
+      specifyHeaders: 'keypair',
+      headerParameters: { parameters: [{ name: 'Accept', value: 'application/vnd.github+json' }, { name: 'X-GitHub-Api-Version', value: '2022-11-28' }] },
+      options: { timeout: 60000 },
+    },
+    credentials: { githubApi: newCredential('GitHub (GITHUB_TOKEN)') }
+  },
+  output: [{ number: 42, html_url: 'https://github.com/acme/webapp/pull/42' }]
+});
+
+const prInfo = node({
+  type: 'n8n-nodes-base.set',
+  version: 3.4,
+  config: {
+    name: 'PR Info',
+    parameters: {
+      mode: 'manual',
+      includeOtherFields: false,
+      assignments: {
+        assignments: [
+          { id: 'pr-url', name: 'pr_url', value: expr('{{ $json.html_url }}'), type: 'string' },
+          { id: 'pr-number', name: 'pr_number', value: expr('{{ $json.number }}'), type: 'number' },
+          { id: 'pr-ticket', name: 'ticket', value: expr('{{ $("Build PR Payload").last().json.ticket.key }}'), type: 'string' },
+          { id: 'pr-branch', name: 'branch', value: expr('{{ $("Build PR Payload").last().json.branch }}'), type: 'string' },
+          { id: 'pr-verdict', name: 'review_verdict', value: expr('{{ $("Build PR Payload").last().json.review.verdict }}'), type: 'string' }
+        ]
+      }
+    }
+  },
+  output: [{ pr_url: 'https://github.com/acme/webapp/pull/42', pr_number: 42, ticket: 'PROJ-101', branch: 'qa/PROJ-101', review_verdict: 'APPROVE' }]
+});
+
+const approval = node({
+  type: 'n8n-nodes-base.slack',
+  version: 2.7,
+  config: {
+    name: 'Slack · Approve Test PR',
+    parameters: {
+      resource: 'message',
+      operation: 'sendAndWait',
+      authentication: 'accessToken',
+      select: 'channel',
+      channelId: { __rl: true, mode: 'name', value: expr('{{ $("Config").first().json.SLACK_CHANNEL }}') },
+      message: expr(':test_tube: *Approve test PR* for *{{ $json.ticket }}* — {{ $("Build PR Payload").last().json.ticket.summary }}\nPR: {{ $json.pr_url }}\nReview gate: *{{ $json.review_verdict }}* · {{ $("Build PR Payload").last().json.design.test_matrix.length }} test cases · {{ $("Build PR Payload").last().json.all_files.length }} files\nApproving dispatches `qa-pr.yml` on `{{ $json.branch }}` (grep `{{ $("Build PR Payload").last().json.grep }}`). The PR is never auto-merged.'),
+      responseType: 'approval',
+      approvalOptions: { values: { approvalType: 'double', approveLabel: 'Approve & run CI', disapproveLabel: 'Decline' } },
+      options: { limitWaitTime: { values: { limitType: 'afterTimeInterval', resumeAmount: 24, resumeUnit: 'hours' } } }
+    },
+    credentials: { slackApi: newCredential('Slack Bot (SLACK_CHANNEL)') }
+  },
+  output: [{ data: { approved: true, respondedAt: '2026-10-16T10:00:00Z' } }]
+});
+
+const isApproved = ifElse({
+  version: 2.3,
+  config: {
+    name: 'Approved?',
+    parameters: {
+      conditions: {
+        options: { caseSensitive: true, leftValue: '', typeValidation: 'loose', version: 2 },
+        conditions: [{ leftValue: expr('{{ $json.data?.approved === true }}'), rightValue: '', operator: { type: 'boolean', operation: 'true', singleValue: true } }],
+        combinator: 'and'
+      }
+    }
+  }
+});
+
+const dispatchCi = node({
+  type: 'n8n-nodes-base.httpRequest',
+  version: 4.5,
+  config: {
+    name: 'GitHub · Dispatch qa-pr.yml',
+    retryOnFail: true,
+    maxTries: 3,
+    waitBetweenTries: 5000,
+    parameters: {
+      method: 'POST',
+      url: expr('https://api.github.com/repos/{{ $("Config").first().json.GITHUB_OWNER }}/{{ $("Config").first().json.GITHUB_REPO }}/actions/workflows/qa-pr.yml/dispatches'),
+      authentication: 'predefinedCredentialType',
+      nodeCredentialType: 'githubApi',
+      sendHeaders: true,
+      specifyHeaders: 'keypair',
+      headerParameters: { parameters: [{ name: 'Accept', value: 'application/vnd.github+json' }, { name: 'X-GitHub-Api-Version', value: '2022-11-28' }] },
+      options: { timeout: 60000 },
+      sendBody: true,
+      contentType: 'json',
+      specifyBody: 'json',
+      jsonBody: expr('{{ JSON.stringify({ ref: $("PR Info").last().json.branch, inputs: { ticket: $("PR Info").last().json.ticket, branch: $("PR Info").last().json.branch, grep: $("Build PR Payload").last().json.grep, dispatch_id: $("Build PR Payload").last().json.dispatch_id, repeat_each: "0", projects: "chromium" } }) }}')
+    },
+    credentials: { githubApi: newCredential('GitHub (GITHUB_TOKEN)') }
+  },
+  output: [{}]
+});
+
+const waitForRun = node({
+  type: 'n8n-nodes-base.wait',
+  version: 1.1,
+  config: { name: 'Wait 20s for Run to Register', parameters: { resume: 'timeInterval', amount: 20, unit: 'seconds' } },
+  output: [{}]
+});
+
+const findRun = node({
+  type: 'n8n-nodes-base.httpRequest',
+  version: 4.5,
+  config: {
+    name: 'GitHub · Find Dispatched Run',
+    retryOnFail: true,
+    maxTries: 3,
+    waitBetweenTries: 5000,
+    parameters: {
+      method: 'GET',
+      url: expr('https://api.github.com/repos/{{ $("Config").first().json.GITHUB_OWNER }}/{{ $("Config").first().json.GITHUB_REPO }}/actions/workflows/qa-pr.yml/runs?event=workflow_dispatch&per_page=20&branch={{ encodeURIComponent($("PR Info").last().json.branch) }}'),
+      authentication: 'predefinedCredentialType',
+      nodeCredentialType: 'githubApi',
+      sendHeaders: true,
+      specifyHeaders: 'keypair',
+      headerParameters: { parameters: [{ name: 'Accept', value: 'application/vnd.github+json' }, { name: 'X-GitHub-Api-Version', value: '2022-11-28' }] },
+      options: { timeout: 60000 },
+    },
+    credentials: { githubApi: newCredential('GitHub (GITHUB_TOKEN)') }
+  },
+  output: [{ total_count: 1, workflow_runs: [{ id: 987654321, display_title: 'qa-pr PROJ-101 [PROJ-101-1-1700000000000]', html_url: 'https://github.com/acme/webapp/actions/runs/987654321' }] }]
+});
+
+const pickRun = node({
+  type: 'n8n-nodes-base.code',
+  version: 2,
+  config: { name: 'Pick Run ID', parameters: { mode: 'runOnceForAllItems', jsCode: ("// Find the run we just dispatched by the dispatch_id embedded in qa-pr.yml's run-name.\n" +
+      "const ctx = $('Build PR Payload').last().json;\n" +
+      "const runs = $input.first().json.workflow_runs || [];\n" +
+      "const run = runs.find((r) => (r.display_title || r.name || '').includes(ctx.dispatch_id));\n" +
+      "return [{ json: { run_id: run ? String(run.id) : '', run_url: run ? run.html_url : '', run_found: !!run } }];\n") } },
+  output: [{ run_id: '987654321', run_url: 'https://github.com/acme/webapp/actions/runs/987654321', run_found: true }]
+});
+
+const labelTicket = node({
+  type: 'n8n-nodes-base.httpRequest',
+  version: 4.5,
+  config: {
+    name: 'Jira · Add Label qa-automated',
+    retryOnFail: true,
+    maxTries: 3,
+    waitBetweenTries: 5000,
+    parameters: {
+      method: 'PUT',
+      url: expr('{{ $("Config").first().json.JIRA_BASE_URL.replace(/\\/$/, "") }}/rest/api/3/issue/{{ $("PR Info").last().json.ticket }}'),
+      authentication: 'predefinedCredentialType',
+      nodeCredentialType: 'jiraSoftwareCloudApi',
+      sendBody: true,
+      contentType: 'json',
+      specifyBody: 'json',
+      jsonBody: '{ "update": { "labels": [ { "add": "qa-automated" } ] } }',
+      options: { timeout: 60000 }
+    },
+    credentials: { jiraSoftwareCloudApi: newCredential('Jira (JIRA_EMAIL + JIRA_API_TOKEN)') }
+  },
+  output: [{}]
+});
+
+const commentTicket = node({
+  type: 'n8n-nodes-base.jira',
+  version: 1,
+  config: {
+    name: 'Jira · Comment PR Link',
+    retryOnFail: true,
+    maxTries: 3,
+    waitBetweenTries: 5000,
+    parameters: {
+      jiraVersion: 'cloud',
+      resource: 'issueComment',
+      operation: 'add',
+      issueKey: expr('{{ $("PR Info").last().json.ticket }}'),
+      comment: expr('QA automation: generated Playwright tests are ready for review.\nPR: {{ $("PR Info").last().json.pr_url }}\nReview gate: {{ $("PR Info").last().json.review_verdict }}\nCI run (qa-pr.yml): {{ $("Pick Run ID").last().json.run_url || "dispatched — run link pending" }}\nBranch: {{ $("PR Info").last().json.branch }}')
+    },
+    credentials: { jiraSoftwareCloudApi: newCredential('Jira (JIRA_EMAIL + JIRA_API_TOKEN)') }
+  },
+  output: [{ id: '10001' }]
+});
+
+const recordRun = node({
+  type: 'n8n-nodes-base.dataTable',
+  version: 1.1,
+  config: {
+    name: 'qa_runs · Record Dispatched Run',
+    parameters: {
+      resource: 'row',
+      operation: 'insert',
+      dataTableId: { __rl: true, mode: 'id', value: '9mMnRlpTU4S4ezRU', cachedResultName: 'qa_runs' },
+      columns: {
+        mappingMode: 'defineBelow',
+        value: {
+          ticket: expr('{{ $("PR Info").last().json.ticket }}'),
+          branch: expr('{{ $("PR Info").last().json.branch }}'),
+          pr_url: expr('{{ $("PR Info").last().json.pr_url }}'),
+          run_id: expr('{{ $("Pick Run ID").last().json.run_id }}'),
+          status: 'ci_dispatched',
+          kind: 'design',
+          dispatch_id: expr('{{ $("Build PR Payload").last().json.dispatch_id }}'),
+          review_verdict: expr('{{ $("PR Info").last().json.review_verdict }}'),
+          module: expr('{{ $("Build PR Payload").last().json.design.module }}')
+        },
+        schema: [{ id: 'ticket', displayName: 'ticket', required: false, defaultMatch: false, display: true, type: 'string', canBeUsedToMatch: true }, { id: 'branch', displayName: 'branch', required: false, defaultMatch: false, display: true, type: 'string', canBeUsedToMatch: true }, { id: 'pr_url', displayName: 'pr_url', required: false, defaultMatch: false, display: true, type: 'string', canBeUsedToMatch: true }, { id: 'run_id', displayName: 'run_id', required: false, defaultMatch: false, display: true, type: 'string', canBeUsedToMatch: true }, { id: 'status', displayName: 'status', required: false, defaultMatch: false, display: true, type: 'string', canBeUsedToMatch: true }, { id: 'kind', displayName: 'kind', required: false, defaultMatch: false, display: true, type: 'string', canBeUsedToMatch: true }, { id: 'dispatch_id', displayName: 'dispatch_id', required: false, defaultMatch: false, display: true, type: 'string', canBeUsedToMatch: true }, { id: 'conclusion', displayName: 'conclusion', required: false, defaultMatch: false, display: true, type: 'string', canBeUsedToMatch: true }, { id: 'merge_decision', displayName: 'merge_decision', required: false, defaultMatch: false, display: true, type: 'string', canBeUsedToMatch: true }, { id: 'review_verdict', displayName: 'review_verdict', required: false, defaultMatch: false, display: true, type: 'string', canBeUsedToMatch: true }, { id: 'module', displayName: 'module', required: false, defaultMatch: false, display: true, type: 'string', canBeUsedToMatch: true }]
+      }
+    }
+  },
+  output: [{ id: 1 }]
+});
+
+const recordDeclined = node({
+  type: 'n8n-nodes-base.dataTable',
+  version: 1.1,
+  config: {
+    name: 'qa_runs · Record Declined',
+    parameters: {
+      resource: 'row',
+      operation: 'insert',
+      dataTableId: { __rl: true, mode: 'id', value: '9mMnRlpTU4S4ezRU', cachedResultName: 'qa_runs' },
+      columns: {
+        mappingMode: 'defineBelow',
+        value: {
+          ticket: expr('{{ $("PR Info").last().json.ticket }}'),
+          branch: expr('{{ $("PR Info").last().json.branch }}'),
+          pr_url: expr('{{ $("PR Info").last().json.pr_url }}'),
+          run_id: '',
+          status: 'declined_or_timed_out',
+          kind: 'design',
+          dispatch_id: expr('{{ $("Build PR Payload").last().json.dispatch_id }}'),
+          review_verdict: expr('{{ $("PR Info").last().json.review_verdict }}'),
+          module: expr('{{ $("Build PR Payload").last().json.design.module }}')
+        },
+        schema: [{ id: 'ticket', displayName: 'ticket', required: false, defaultMatch: false, display: true, type: 'string', canBeUsedToMatch: true }, { id: 'branch', displayName: 'branch', required: false, defaultMatch: false, display: true, type: 'string', canBeUsedToMatch: true }, { id: 'pr_url', displayName: 'pr_url', required: false, defaultMatch: false, display: true, type: 'string', canBeUsedToMatch: true }, { id: 'run_id', displayName: 'run_id', required: false, defaultMatch: false, display: true, type: 'string', canBeUsedToMatch: true }, { id: 'status', displayName: 'status', required: false, defaultMatch: false, display: true, type: 'string', canBeUsedToMatch: true }, { id: 'kind', displayName: 'kind', required: false, defaultMatch: false, display: true, type: 'string', canBeUsedToMatch: true }, { id: 'dispatch_id', displayName: 'dispatch_id', required: false, defaultMatch: false, display: true, type: 'string', canBeUsedToMatch: true }, { id: 'conclusion', displayName: 'conclusion', required: false, defaultMatch: false, display: true, type: 'string', canBeUsedToMatch: true }, { id: 'merge_decision', displayName: 'merge_decision', required: false, defaultMatch: false, display: true, type: 'string', canBeUsedToMatch: true }, { id: 'review_verdict', displayName: 'review_verdict', required: false, defaultMatch: false, display: true, type: 'string', canBeUsedToMatch: true }, { id: 'module', displayName: 'module', required: false, defaultMatch: false, display: true, type: 'string', canBeUsedToMatch: true }]
+      }
+    }
+  },
+  output: [{ id: 2 }]
+});
+
+const nextTicket = node({
+  type: 'n8n-nodes-base.noOp',
+  version: 1,
+  config: { name: 'Next Ticket' },
+  output: [{}]
+});
+
+const note = sticky('## QA | Design & Automate (WF1)\nSOP stages: **Design → Automate → Review → Run in CI**.\n1. Jira JQL (Config.JIRA_PROJECT) → skip tickets already in `qa_runs`.\n2. Per ticket: Test Design → Spec Generator → API/Data agents (only if relevant) → Code Review. `CHANGES` loops back to Spec Generator at most 2×.\n3. Commit to `qa/<KEY>` (Git Data API), open **draft** PR, ask Slack for approval.\n4. Approved → dispatch `qa-pr.yml` {ticket, branch, grep}, label Jira `qa-automated`, comment, record in `qa_runs`.\nEvery agent output is strictly schema-validated in a Code node (fail fast → WF4). Never auto-merges.', [], { color: 4 });
+
+export default workflow('qa-design-automate', 'QA | Design & Automate')
+  .add(note)
+  .add(manualRun)
+  .to(config)
+  .add(every2h)
+  .to(config)
+  .add(config)
+  .to(searchTickets)
+  .to(normalizeTickets)
+  .to(skipProcessed)
+  .to(loopTickets.onEachBatch(
+    currentTicket
+      .to(testDesignAgent)
+      .to(validateDesign)
+      .to(specContext)
+      .to(specAgent)
+      .to(validateSpec)
+      .to(hasEndpoints
+        .onTrue(apiAgent.to(validateApi).to(touchesDb))
+        .onFalse(noApi.to(touchesDb)))
+  ))
+  .add(touchesDb
+    .onTrue(dataAgent.to(validateData).to(assembleReview))
+    .onFalse(noData.to(assembleReview)))
+  .add(assembleReview)
+  .to(reviewAgent)
+  .to(validateReview)
+  .to(reviseSpecs
+    .onTrue(prepareRevision.to(specContext))
+    .onFalse(buildPr))
+  .add(buildPr)
+  .to(getBaseBranch)
+  .to(createTree)
+  .to(createCommit)
+  .to(createBranch)
+  .to(openPr)
+  .add(createBranch.onError(forceUpdateBranch.to(openPr)))
+  .add(openPr)
+  .to(prInfo)
+  .add(openPr.onError(findExistingPr.to(prInfo)))
+  .add(prInfo)
+  .to(approval)
+  .to(isApproved
+    .onTrue(dispatchCi.to(waitForRun).to(findRun).to(pickRun).to(labelTicket).to(commentTicket).to(recordRun).to(nextTicket))
+    .onFalse(recordDeclined.to(nextTicket)))
+  .add(nextTicket)
+  .to(nextBatch(loopTickets));
