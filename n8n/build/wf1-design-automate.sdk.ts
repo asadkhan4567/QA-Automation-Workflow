@@ -396,16 +396,6 @@ const validateDesign = node({
       "  if (e.length) throw new Error(`[${label}] schema mismatch (${e.length}): ${e.slice(0, 12).join('; ')}`);\n" +
       "  return v;\n" +
       "}\n" +
-      "const FILE_SCHEMA = { type: 'object', required: ['path', 'content'], props: { path: { type: 'string', minLength: 1 }, content: { type: 'string', minLength: 1 } } };\n" +
-      "function assertFiles(files, prefixes, label) {\n" +
-      "  for (const f of files) {\n" +
-      "    const p = f.path;\n" +
-      "    if (p.includes('..') || p.startsWith('/') || p.includes('\\\\') || !prefixes.some((x) => p.startsWith(x))) throw new Error(`[${label}] path not allowed: \"${p}\" (allowed: ${prefixes.join(', ')})`);\n" +
-      "    if (!p.endsWith('.ts')) throw new Error(`[${label}] only .ts files allowed: \"${p}\"`);\n" +
-      "    if (/waitForTimeout\\s*\\(|setTimeout\\s*\\(/.test(f.content)) throw new Error(`[${label}] hard sleep found in ${p}`);\n" +
-      "  }\n" +
-      "  return files;\n" +
-      "}\n" +
       "// end shared helpers\n" +
       "\n" +
       "const ticket = $('Current Ticket').last().json;\n" +
@@ -804,6 +794,9 @@ const validateSpec = node({
       "  if (e.length) throw new Error(`[${label}] schema mismatch (${e.length}): ${e.slice(0, 12).join('; ')}`);\n" +
       "  return v;\n" +
       "}\n" +
+      "// end shared helpers\n" +
+      "\n" +
+      "// file-output helpers (prepended by n8n/build.py when used)\n" +
       "const FILE_SCHEMA = { type: 'object', required: ['path', 'content'], props: { path: { type: 'string', minLength: 1 }, content: { type: 'string', minLength: 1 } } };\n" +
       "function assertFiles(files, prefixes, label) {\n" +
       "  for (const f of files) {\n" +
@@ -814,7 +807,6 @@ const validateSpec = node({
       "  }\n" +
       "  return files;\n" +
       "}\n" +
-      "// end shared helpers\n" +
       "\n" +
       "const ctx = $('Spec Context').last().json;\n" +
       "const key = ctx.ticket.key;\n" +
@@ -1182,6 +1174,9 @@ const validateApi = node({
       "  if (e.length) throw new Error(`[${label}] schema mismatch (${e.length}): ${e.slice(0, 12).join('; ')}`);\n" +
       "  return v;\n" +
       "}\n" +
+      "// end shared helpers\n" +
+      "\n" +
+      "// file-output helpers (prepended by n8n/build.py when used)\n" +
       "const FILE_SCHEMA = { type: 'object', required: ['path', 'content'], props: { path: { type: 'string', minLength: 1 }, content: { type: 'string', minLength: 1 } } };\n" +
       "function assertFiles(files, prefixes, label) {\n" +
       "  for (const f of files) {\n" +
@@ -1192,7 +1187,6 @@ const validateApi = node({
       "  }\n" +
       "  return files;\n" +
       "}\n" +
-      "// end shared helpers\n" +
       "\n" +
       "const ctx = $('Has Endpoints?').last().json;\n" +
       "const key = ctx.ticket.key;\n" +
@@ -1601,6 +1595,9 @@ const validateData = node({
       "  if (e.length) throw new Error(`[${label}] schema mismatch (${e.length}): ${e.slice(0, 12).join('; ')}`);\n" +
       "  return v;\n" +
       "}\n" +
+      "// end shared helpers\n" +
+      "\n" +
+      "// file-output helpers (prepended by n8n/build.py when used)\n" +
       "const FILE_SCHEMA = { type: 'object', required: ['path', 'content'], props: { path: { type: 'string', minLength: 1 }, content: { type: 'string', minLength: 1 } } };\n" +
       "function assertFiles(files, prefixes, label) {\n" +
       "  for (const f of files) {\n" +
@@ -1611,7 +1608,6 @@ const validateData = node({
       "  }\n" +
       "  return files;\n" +
       "}\n" +
-      "// end shared helpers\n" +
       "\n" +
       "const ctx = $('Touches DB?').last().json;\n" +
       "const key = ctx.ticket.key;\n" +
@@ -1859,16 +1855,6 @@ const validateReview = node({
       "  const e = []; checkSchema(v, s, '$', e);\n" +
       "  if (e.length) throw new Error(`[${label}] schema mismatch (${e.length}): ${e.slice(0, 12).join('; ')}`);\n" +
       "  return v;\n" +
-      "}\n" +
-      "const FILE_SCHEMA = { type: 'object', required: ['path', 'content'], props: { path: { type: 'string', minLength: 1 }, content: { type: 'string', minLength: 1 } } };\n" +
-      "function assertFiles(files, prefixes, label) {\n" +
-      "  for (const f of files) {\n" +
-      "    const p = f.path;\n" +
-      "    if (p.includes('..') || p.startsWith('/') || p.includes('\\\\') || !prefixes.some((x) => p.startsWith(x))) throw new Error(`[${label}] path not allowed: \"${p}\" (allowed: ${prefixes.join(', ')})`);\n" +
-      "    if (!p.endsWith('.ts')) throw new Error(`[${label}] only .ts files allowed: \"${p}\"`);\n" +
-      "    if (/waitForTimeout\\s*\\(|setTimeout\\s*\\(/.test(f.content)) throw new Error(`[${label}] hard sleep found in ${p}`);\n" +
-      "  }\n" +
-      "  return files;\n" +
       "}\n" +
       "// end shared helpers\n" +
       "\n" +

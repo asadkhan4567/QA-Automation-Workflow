@@ -1,0 +1,145 @@
+{
+  "name": "QA | Error Handler",
+  "nodes": [
+    {
+      "id": "e11b72cc-0814-4128-9a4e-06e8631e50d4",
+      "name": "Sticky Note 555bab49",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        272,
+        0
+      ],
+      "parameters": {
+        "content": "## QA | Error Handler (WF4)\nSet as the **Error workflow** of WF1–WF3 (Workflow settings → Error workflow). Fires on production executions only.\nPosts workflow name, failing node, execution ID (+ link) and the error message to Slack — including strict-JSON schema failures thrown by the validator Code nodes.",
+        "color": 3
+      }
+    },
+    {
+      "id": "06202153-dac6-4802-99e7-c1027427252c",
+      "name": "On Workflow Error",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "66af9fc3-ff3f-4cf3-b738-bdfb8b42f5ef",
+      "name": "Config",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        224,
+        0
+      ],
+      "parameters": {
+        "mode": "manual",
+        "includeOtherFields": true,
+        "assignments": {
+          "assignments": [
+            {
+              "id": "c1",
+              "name": "SLACK_CHANNEL",
+              "value": "<SET_ME:SLACK_CHANNEL>",
+              "type": "string"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "5b3d5474-743b-4468-bfc8-a79118c0cc99",
+      "name": "Format Alert",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        448,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Error Trigger payload -> Slack alert (workflow, node, execution id, message). Handles trigger-level errors too.\nconst e = $input.first().json;\nconst exec = e.execution || {};\nconst trig = e.trigger || {};\nconst err = exec.error || trig.error || {};\nconst node = exec.lastNodeExecuted || err.node?.name || trig.error?.node?.name || 'n/a';\nconst msg = String(err.message || err.description || 'Unknown error').slice(0, 900);\nconst text = [\n  `:rotating_light: *n8n workflow failed* — *${e.workflow?.name || 'unknown workflow'}*`,\n  `• Workflow ID: \\`${e.workflow?.id || 'n/a'}\\``,\n  `• Node: \\`${node}\\``,\n  `• Execution ID: \\`${exec.id || 'n/a (trigger error)'}\\`${exec.url ? ` · <${exec.url}|open execution>` : ''}`,\n  `• Mode: ${exec.mode || trig.mode || 'n/a'}${exec.retryOf ? ` · retry of ${exec.retryOf}` : ''}`,\n  '• Error:',\n  '```' + msg + '```',\n].join('\\n');\nreturn [{ json: { text, workflow: e.workflow?.name, node, execution_id: exec.id, message: msg } }];\n"
+      }
+    },
+    {
+      "id": "623fccf8-9833-4987-9b9a-c01173af9890",
+      "name": "Slack · Error Alert",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.7,
+      "position": [
+        672,
+        0
+      ],
+      "parameters": {
+        "resource": "message",
+        "operation": "post",
+        "authentication": "accessToken",
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "mode": "name",
+          "value": "={{ $(\"Config\").first().json.SLACK_CHANNEL }}"
+        },
+        "messageType": "text",
+        "text": "={{ $json.text }}",
+        "otherOptions": {
+          "includeLinkToWorkflow": false
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "webhookId": "f1e68f02-ddd7-40d3-9e9c-8e23a671b80d"
+    }
+  ],
+  "connections": {
+    "On Workflow Error": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Config": {
+      "main": [
+        [
+          {
+            "node": "Format Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Alert": {
+      "main": [
+        [
+          {
+            "node": "Slack · Error Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "availableInMCP": true
+  },
+  "id": "J5xzUk8hMd46SmLP",
+  "active": false,
+  "description": "Sprint QA Automation WF4: Error Trigger → Slack alert with workflow name, failing node, execution ID and error message. Error workflow for WF1–WF3.",
+  "nodeGroups": [],
+  "pinData": {},
+  "meta": {
+    "exportedFrom": "n8n draft, versionId bdd8f556-daf3-4bea-85da-af5c04b3537b"
+  }
+}

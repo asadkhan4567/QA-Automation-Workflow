@@ -5,7 +5,7 @@ const hook = trigger({
   version: 2.2,
   config: {
     name: 'GitHub workflow_run Webhook',
-    parameters: { httpMethod: 'POST', path: 'qa-ci-result', responseMode: 'onReceived', options: { rawBody: true, responseCode: { values: { responseCode: 202 } } } }
+    parameters: { httpMethod: 'POST', path: 'qa-ci-result', responseMode: 'onReceived', options: { rawBody: true, responseCode: { values: { responseCode: 200 } } } }
   },
   output: [{ headers: { 'x-github-event': 'workflow_run', 'x-hub-signature-256': 'sha256=abc' }, body: { action: 'completed' } }]
 });
@@ -636,16 +636,6 @@ const validateTriage = node({
       "  if (e.length) throw new Error(`[${label}] schema mismatch (${e.length}): ${e.slice(0, 12).join('; ')}`);\n" +
       "  return v;\n" +
       "}\n" +
-      "const FILE_SCHEMA = { type: 'object', required: ['path', 'content'], props: { path: { type: 'string', minLength: 1 }, content: { type: 'string', minLength: 1 } } };\n" +
-      "function assertFiles(files, prefixes, label) {\n" +
-      "  for (const f of files) {\n" +
-      "    const p = f.path;\n" +
-      "    if (p.includes('..') || p.startsWith('/') || p.includes('\\\\') || !prefixes.some((x) => p.startsWith(x))) throw new Error(`[${label}] path not allowed: \"${p}\" (allowed: ${prefixes.join(', ')})`);\n" +
-      "    if (!p.endsWith('.ts')) throw new Error(`[${label}] only .ts files allowed: \"${p}\"`);\n" +
-      "    if (/waitForTimeout\\s*\\(|setTimeout\\s*\\(/.test(f.content)) throw new Error(`[${label}] hard sleep found in ${p}`);\n" +
-      "  }\n" +
-      "  return files;\n" +
-      "}\n" +
       "// end shared helpers\n" +
       "\n" +
       "const ctx = $('Triage Input').last().json;\n" +
@@ -973,16 +963,6 @@ const validateBug = node({
       "  const e = []; checkSchema(v, s, '$', e);\n" +
       "  if (e.length) throw new Error(`[${label}] schema mismatch (${e.length}): ${e.slice(0, 12).join('; ')}`);\n" +
       "  return v;\n" +
-      "}\n" +
-      "const FILE_SCHEMA = { type: 'object', required: ['path', 'content'], props: { path: { type: 'string', minLength: 1 }, content: { type: 'string', minLength: 1 } } };\n" +
-      "function assertFiles(files, prefixes, label) {\n" +
-      "  for (const f of files) {\n" +
-      "    const p = f.path;\n" +
-      "    if (p.includes('..') || p.startsWith('/') || p.includes('\\\\') || !prefixes.some((x) => p.startsWith(x))) throw new Error(`[${label}] path not allowed: \"${p}\" (allowed: ${prefixes.join(', ')})`);\n" +
-      "    if (!p.endsWith('.ts')) throw new Error(`[${label}] only .ts files allowed: \"${p}\"`);\n" +
-      "    if (/waitForTimeout\\s*\\(|setTimeout\\s*\\(/.test(f.content)) throw new Error(`[${label}] hard sleep found in ${p}`);\n" +
-      "  }\n" +
-      "  return files;\n" +
       "}\n" +
       "// end shared helpers\n" +
       "\n" +

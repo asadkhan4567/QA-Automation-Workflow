@@ -1,0 +1,1943 @@
+{
+  "name": "QA | CI Result & Triage",
+  "nodes": [
+    {
+      "id": "727ddc8d-e401-4452-9860-075d102f1a00",
+      "name": "Sticky Note ca9b5e11",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        2528,
+        1216
+      ],
+      "parameters": {
+        "content": "## QA | CI Result & Triage (WF2)\nSOP stages: **Triage → Report**.\nGitHub repo webhook (event: *Workflow runs*, content type JSON, secret = Config.GITHUB_WEBHOOK_SECRET) → HMAC-SHA256 check of the raw body → only completed `qa-pr.yml` runs.\n- success → Jira ✅ comment, Slack ✅, qa_runs passed\n- failure → unzip `results-json` in a Code node → Triage agent → route: ProductBug → Bug Report agent → Jira Bug + Bug Sheet row · Flaky/TestBug/TestData → Jira Task · Environment → re-run once · conf < 0.7 → Slack review\n- Slack summary with MERGE BLOCK / ALLOW_AFTER_FIX / ALLOW. Fix-verification runs only update qa_runs (WF3 decides).",
+        "color": 5
+      }
+    },
+    {
+      "id": "06c297f6-8abc-4602-b05a-9beaa6fccd3c",
+      "name": "GitHub workflow_run Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.2,
+      "position": [
+        0,
+        832
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "qa-ci-result",
+        "responseMode": "onReceived",
+        "options": {
+          "rawBody": true,
+          "responseCode": {
+            "values": {
+              "responseCode": 200
+            }
+          }
+        }
+      },
+      "webhookId": "e712394f-b232-495a-83fe-597bca98aa4a"
+    },
+    {
+      "id": "1cacd630-18fe-4f70-b9ef-742494839721",
+      "name": "Config",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        224,
+        832
+      ],
+      "parameters": {
+        "mode": "manual",
+        "includeOtherFields": true,
+        "assignments": {
+          "assignments": [
+            {
+              "id": "c1",
+              "name": "JIRA_PROJECT",
+              "value": "<SET_ME:JIRA_PROJECT>",
+              "type": "string"
+            },
+            {
+              "id": "c2",
+              "name": "JIRA_BASE_URL",
+              "value": "<SET_ME:JIRA_BASE_URL>",
+              "type": "string"
+            },
+            {
+              "id": "c3",
+              "name": "GITHUB_OWNER",
+              "value": "<SET_ME:GITHUB_OWNER>",
+              "type": "string"
+            },
+            {
+              "id": "c4",
+              "name": "GITHUB_REPO",
+              "value": "<SET_ME:GITHUB_REPO>",
+              "type": "string"
+            },
+            {
+              "id": "c5",
+              "name": "SLACK_CHANNEL",
+              "value": "<SET_ME:SLACK_CHANNEL>",
+              "type": "string"
+            },
+            {
+              "id": "c6",
+              "name": "BUG_SHEET_ID",
+              "value": "<SET_ME:BUG_SHEET_ID>",
+              "type": "string"
+            },
+            {
+              "id": "c7",
+              "name": "BUG_SHEET_TAB",
+              "value": "Bugs",
+              "type": "string"
+            },
+            {
+              "id": "c8",
+              "name": "GITHUB_WEBHOOK_SECRET",
+              "value": "<SET_ME:GITHUB_WEBHOOK_SECRET>",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {
+          "includeBinary": true
+        }
+      }
+    },
+    {
+      "id": "736d4ebb-05c1-4fb1-a80c-e57cdd00b55a",
+      "name": "Verify Signature & Filter",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        448,
+        832
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Verify GitHub's X-Hub-Signature-256 over the RAW request body, then keep only completed qa-pr.yml runs.\nconst crypto = require('crypto');\nconst cfg = $('Config').first().json;\nconst item = $input.first();\nconst headers = item.json.headers || {};\nconst secret = String(cfg.GITHUB_WEBHOOK_SECRET || '');\nif (!secret || secret.startsWith('<SET_ME')) throw new Error('GITHUB_WEBHOOK_SECRET is not configured in Config');\nif (!item.binary || !item.binary.data) throw new Error('Raw body missing — enable the Webhook option \"Raw Body\"');\nconst raw = await this.helpers.getBinaryDataBuffer(0, 'data');\nconst enc = new TextEncoder();\nconst expected = enc.encode('sha256=' + crypto.createHmac('sha256', secret).update(raw).digest('hex'));\nconst got = enc.encode(String(headers['x-hub-signature-256'] || ''));\nif (got.length !== expected.length || !crypto.timingSafeEqual(got, expected)) {\n  throw new Error(`Invalid X-Hub-Signature-256 (delivery ${headers['x-github-delivery'] || 'n/a'}) — request rejected`);\n}\nconst body = JSON.parse(new TextDecoder().decode(raw));\nconst event = headers['x-github-event'];\nconst run = body.workflow_run;\nconst path = String(body.workflow?.path || run?.path || '');\nif (event !== 'workflow_run' || body.action !== 'completed' || !run || !/qa-pr\\.ya?ml$/.test(path)) return [];\nconst title = String(run.display_title || run.name || '');\nconst m = title.match(/qa-pr\\s+([A-Z][A-Z0-9]+-\\d+)\\s+\\[([^\\]]+)\\]/);\nconst branchKey = String(run.head_branch || '').match(/^qa\\/([A-Z][A-Z0-9]+-\\d+)$/);\nconst ticket = m ? m[1] : branchKey ? branchKey[1] : '';\nconst dispatch_id = m ? m[2] : '';\nreturn [{\n  json: {\n    run_id: String(run.id),\n    run_attempt: run.run_attempt || 1,\n    conclusion: run.conclusion,\n    run_url: run.html_url,\n    artifacts_url: run.artifacts_url,\n    head_branch: run.head_branch,\n    head_sha: run.head_sha,\n    trigger_event: run.event,\n    display_title: title,\n    repo: body.repository?.full_name || `${cfg.GITHUB_OWNER}/${cfg.GITHUB_REPO}`,\n    ticket,\n    dispatch_id,\n    row_key: dispatch_id || `run-${run.id}`,\n    delivery: headers['x-github-delivery'] || '',\n  },\n}];\n"
+      }
+    },
+    {
+      "id": "aa57b2ba-2017-4562-af5e-d09545d80611",
+      "name": "qa_runs · Find Run Row",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        672,
+        832
+      ],
+      "parameters": {
+        "resource": "row",
+        "operation": "get",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "9mMnRlpTU4S4ezRU",
+          "cachedResultName": "qa_runs"
+        },
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "dispatch_id",
+              "condition": "eq",
+              "keyValue": "={{ $json.row_key }}"
+            }
+          ]
+        }
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "id": "a14d7884-d52b-4f1d-9b8f-3f76af13a02d",
+      "name": "Run Context",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        896,
+        832
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Merge the verified run with its qa_runs row (absent for manual / pull_request runs).\nconst run = $('Verify Signature & Filter').first().json;\nconst row = $input.all().map((i) => i.json).find((r) => r && r.id !== undefined) || {};\nreturn [{ json: { ...run, kind: row.kind || 'pr', module: row.module || '', pr_url: row.pr_url || '', branch: row.branch || run.head_branch, qa_row_found: !!row.id } }];\n"
+      }
+    },
+    {
+      "id": "f2ac2dd8-9875-4df0-aea7-b9f116a6b3b3",
+      "name": "Fix-Verification Run?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        1120,
+        832
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.kind }}",
+              "rightValue": "verification",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      }
+    },
+    {
+      "id": "6c3cbf26-0da0-4db4-9e11-7147da6816ef",
+      "name": "qa_runs · Record Verification Result",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        1344,
+        720
+      ],
+      "parameters": {
+        "resource": "row",
+        "operation": "upsert",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "9mMnRlpTU4S4ezRU",
+          "cachedResultName": "qa_runs"
+        },
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "dispatch_id",
+              "condition": "eq",
+              "keyValue": "={{ $json.row_key }}"
+            }
+          ]
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "run_id": "={{ $json.run_id }}",
+            "status": "={{ $json.conclusion === \"success\" ? \"passed\" : \"failed\" }}",
+            "conclusion": "={{ $json.conclusion }}",
+            "dispatch_id": "={{ $json.row_key }}"
+          },
+          "schema": [
+            {
+              "id": "run_id",
+              "displayName": "run_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "status",
+              "displayName": "status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "dispatch_id",
+              "displayName": "dispatch_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "conclusion",
+              "displayName": "conclusion",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "ca7f5170-1d1f-4719-af59-f6e2b3e42156",
+      "name": "Route by Conclusion",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [
+        1344,
+        912
+      ],
+      "parameters": {
+        "mode": "rules",
+        "rules": {
+          "values": [
+            {
+              "renameOutput": true,
+              "outputKey": "success",
+              "conditions": {
+                "options": {
+                  "caseSensitive": false,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.conclusion }}",
+                    "rightValue": "success",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "renameOutput": true,
+              "outputKey": "failure",
+              "conditions": {
+                "options": {
+                  "caseSensitive": false,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ [\"failure\", \"timed_out\"].includes($json.conclusion) }}",
+                    "rightValue": "",
+                    "operator": {
+                      "type": "boolean",
+                      "operation": "true",
+                      "singleValue": true
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra",
+          "renameFallbackOutput": "cancelled/other"
+        }
+      }
+    },
+    {
+      "id": "2e8a983c-a406-47cd-8da6-fa9d8b8e9587",
+      "name": "CI Passed",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        1568,
+        544
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "a3b82ee6-9320-44e4-a53d-fee0d87e9d57",
+      "name": "GitHub · List Run Artifacts",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        1568,
+        960
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $json.artifacts_url }}?per_page=100",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "githubApi",
+        "sendHeaders": true,
+        "specifyHeaders": "keypair",
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Accept",
+              "value": "application/vnd.github+json"
+            },
+            {
+              "name": "X-GitHub-Api-Version",
+              "value": "2022-11-28"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 60000
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "id": "9e443e90-ce1f-4b45-aa05-125e14ea70a2",
+      "name": "qa_runs · Record Cancelled/Other",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        1568,
+        1152
+      ],
+      "parameters": {
+        "resource": "row",
+        "operation": "upsert",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "9mMnRlpTU4S4ezRU",
+          "cachedResultName": "qa_runs"
+        },
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "dispatch_id",
+              "condition": "eq",
+              "keyValue": "={{ $json.row_key }}"
+            }
+          ]
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "run_id": "={{ $json.run_id }}",
+            "status": "={{ $json.conclusion }}",
+            "conclusion": "={{ $json.conclusion }}",
+            "dispatch_id": "={{ $json.row_key }}"
+          },
+          "schema": [
+            {
+              "id": "run_id",
+              "displayName": "run_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "status",
+              "displayName": "status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "dispatch_id",
+              "displayName": "dispatch_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "conclusion",
+              "displayName": "conclusion",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "af55a51a-806b-4a4e-bbc7-e41014698343",
+      "name": "Jira · Comment CI Passed",
+      "type": "n8n-nodes-base.jira",
+      "typeVersion": 1,
+      "position": [
+        1792,
+        384
+      ],
+      "parameters": {
+        "jiraVersion": "cloud",
+        "resource": "issueComment",
+        "operation": "add",
+        "issueKey": "={{ $json.ticket }}",
+        "comment": "=QA automation ✅ qa-pr passed for {{ $json.head_branch }} ({{ $json.head_sha.slice(0, 7) }}).\nRun: {{ $json.run_url }}\n{{ $json.pr_url ? \"PR: \" + $json.pr_url + \" — ready for human review and merge.\" : \"\" }}"
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "id": "1851287f-15e7-4ae5-834e-ffb12f70c5b3",
+      "name": "Slack · CI Passed",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.7,
+      "position": [
+        1792,
+        576
+      ],
+      "parameters": {
+        "resource": "message",
+        "operation": "post",
+        "authentication": "accessToken",
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "mode": "name",
+          "value": "={{ $(\"Config\").first().json.SLACK_CHANNEL }}"
+        },
+        "messageType": "text",
+        "text": "=:white_check_mark: *qa-pr passed* — {{ $json.ticket || $json.head_branch }} · <{{ $json.run_url }}|run {{ $json.run_id }}>{{ $json.pr_url ? \"\\nPR: \" + $json.pr_url : \"\" }}\n*MERGE: ALLOW* (human approval still required)"
+      },
+      "onError": "continueRegularOutput",
+      "webhookId": "ad72f7d4-6a89-4c1c-89dc-1cb0270715d2"
+    },
+    {
+      "id": "a7111843-3ea2-4ee6-8f68-daace7c7ca96",
+      "name": "qa_runs · Record Passed",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        1792,
+        768
+      ],
+      "parameters": {
+        "resource": "row",
+        "operation": "upsert",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "9mMnRlpTU4S4ezRU",
+          "cachedResultName": "qa_runs"
+        },
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "dispatch_id",
+              "condition": "eq",
+              "keyValue": "={{ $json.row_key }}"
+            }
+          ]
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "ticket": "={{ $json.ticket }}",
+            "branch": "={{ $json.branch }}",
+            "pr_url": "={{ $json.pr_url }}",
+            "run_id": "={{ $json.run_id }}",
+            "status": "passed",
+            "kind": "={{ $json.kind }}",
+            "dispatch_id": "={{ $json.row_key }}",
+            "conclusion": "success",
+            "merge_decision": "ALLOW",
+            "module": "={{ $json.module }}"
+          },
+          "schema": [
+            {
+              "id": "ticket",
+              "displayName": "ticket",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "branch",
+              "displayName": "branch",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "pr_url",
+              "displayName": "pr_url",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "run_id",
+              "displayName": "run_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "status",
+              "displayName": "status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "kind",
+              "displayName": "kind",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "dispatch_id",
+              "displayName": "dispatch_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "conclusion",
+              "displayName": "conclusion",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "merge_decision",
+              "displayName": "merge_decision",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "module",
+              "displayName": "module",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "f9ebf7f7-246d-4a94-bf4e-d7479e094fde",
+      "name": "Pick results-json Artifact",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1792,
+        960
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const ctx = $('Run Context').first().json;\nconst arts = $input.first().json.artifacts || [];\nconst a = arts.find((x) => x.name === 'results-json' && !x.expired);\nreturn [{ json: { ...ctx, has_results: !!a, artifact_url: a ? a.archive_download_url : '', artifact_size: a ? a.size_in_bytes : 0 } }];\n"
+      }
+    },
+    {
+      "id": "06ca93b1-b17b-4cc0-83cf-5178886ead52",
+      "name": "Has results.json?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        2016,
+        960
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.has_results }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      }
+    },
+    {
+      "id": "af32145a-15be-4732-b1ae-a58d860a21ce",
+      "name": "GitHub · Download results-json.zip",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        2240,
+        832
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $json.artifact_url }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "githubApi",
+        "options": {
+          "timeout": 60000,
+          "response": {
+            "response": {
+              "responseFormat": "file",
+              "outputPropertyName": "data"
+            }
+          }
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "id": "05c57345-c0f4-4e43-ac5a-55d374701d2e",
+      "name": "Unzip & Parse results.json",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2464,
+        832
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Minimal ZIP reader + RFC1951 inflate in pure JS (n8n Cloud blocks the zlib module in Code nodes).\nfunction inflateRaw(src) {\n  const out = []; let pos = 0, bitBuf = 0, bitCnt = 0;\n  const bits = (n) => { while (bitCnt < n) { if (pos >= src.length) throw new Error('inflate: unexpected end'); bitBuf |= src[pos++] << bitCnt; bitCnt += 8; } const v = bitBuf & ((1 << n) - 1); bitBuf >>>= n; bitCnt -= n; return v; };\n  const build = (lens) => { const count = new Array(16).fill(0); lens.forEach((l) => count[l]++); count[0] = 0; const offs = [0]; for (let i = 1; i < 16; i++) offs[i] = offs[i - 1] + count[i - 1]; const sym = []; lens.forEach((l, s) => { if (l) sym[offs[l]++] = s; }); return { count, sym }; };\n  const decode = (h) => { let code = 0, first = 0, idx = 0; for (let len = 1; len < 16; len++) { code |= bits(1); const c = h.count[len]; if (code - c < first) return h.sym[idx + (code - first)]; idx += c; first += c; first <<= 1; code <<= 1; } throw new Error('inflate: bad code'); };\n  const LB = [3,4,5,6,7,8,9,10,11,13,15,17,19,23,27,31,35,43,51,59,67,83,99,115,131,163,195,227,258], LE = [0,0,0,0,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5,0];\n  const DB = [1,2,3,4,5,7,9,13,17,25,33,49,65,97,129,193,257,385,513,769,1025,1537,2049,3073,4097,6145,8193,12289,16385,24577], DE = [0,0,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10,10,11,11,12,12,13,13];\n  let fixedL, fixedD;\n  let final = 0;\n  while (!final) {\n    final = bits(1); const type = bits(2);\n    if (type === 0) {\n      bitBuf = 0; bitCnt = 0; const len = src[pos] | (src[pos + 1] << 8); pos += 4;\n      for (let i = 0; i < len; i++) out.push(src[pos++]);\n      continue;\n    }\n    let lit, dist;\n    if (type === 1) {\n      if (!fixedL) { const l = []; for (let i = 0; i < 288; i++) l[i] = i < 144 ? 8 : i < 256 ? 9 : i < 280 ? 7 : 8; fixedL = build(l); fixedD = build(new Array(30).fill(5)); }\n      lit = fixedL; dist = fixedD;\n    } else if (type === 2) {\n      const hlit = bits(5) + 257, hdist = bits(5) + 1, hclen = bits(4) + 4;\n      const ord = [16,17,18,0,8,7,9,6,10,5,11,4,12,3,13,2,14,1,15]; const cl = new Array(19).fill(0);\n      for (let i = 0; i < hclen; i++) cl[ord[i]] = bits(3);\n      const ch = build(cl); const lens = [];\n      while (lens.length < hlit + hdist) {\n        const s = decode(ch);\n        if (s < 16) lens.push(s);\n        else if (s === 16) { const prev = lens[lens.length - 1]; for (let r = 3 + bits(2); r > 0; r--) lens.push(prev); }\n        else if (s === 17) { for (let r = 3 + bits(3); r > 0; r--) lens.push(0); }\n        else { for (let r = 11 + bits(7); r > 0; r--) lens.push(0); }\n      }\n      lit = build(lens.slice(0, hlit)); dist = build(lens.slice(hlit));\n    } else throw new Error('inflate: bad block type');\n    for (;;) {\n      const s = decode(lit);\n      if (s < 256) out.push(s);\n      else if (s === 256) break;\n      else { const i = s - 257; const len = LB[i] + bits(LE[i]); const d = decode(dist); const off = DB[d] + bits(DE[d]); const start = out.length - off; for (let k = 0; k < len; k++) out.push(out[start + k]); }\n    }\n  }\n  return Uint8Array.from(out);\n}\nfunction unzip(buf) {\n  const u8 = buf instanceof Uint8Array ? buf : new Uint8Array(buf);\n  const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);\n  let eocd = -1;\n  for (let i = u8.length - 22; i >= Math.max(0, u8.length - 65557); i--) if (dv.getUint32(i, true) === 0x06054b50) { eocd = i; break; }\n  if (eocd < 0) throw new Error('unzip: not a zip archive');\n  const n = dv.getUint16(eocd + 10, true); let p = dv.getUint32(eocd + 16, true); const files = {};\n  for (let k = 0; k < n; k++) {\n    if (dv.getUint32(p, true) !== 0x02014b50) throw new Error('unzip: bad central directory');\n    const method = dv.getUint16(p + 10, true), csize = dv.getUint32(p + 20, true);\n    const nlen = dv.getUint16(p + 28, true), xlen = dv.getUint16(p + 30, true), clen = dv.getUint16(p + 32, true), lho = dv.getUint32(p + 42, true);\n    const name = new TextDecoder().decode(u8.subarray(p + 46, p + 46 + nlen));\n    const dataStart = lho + 30 + dv.getUint16(lho + 26, true) + dv.getUint16(lho + 28, true);\n    const raw = u8.subarray(dataStart, dataStart + csize);\n    if (method === 0) files[name] = raw; else if (method === 8) files[name] = inflateRaw(raw); else throw new Error(`unzip: method ${method} unsupported`);\n    p += 46 + nlen + xlen + clen;\n  }\n  return files;\n}\n\n// Unzip the results-json artifact and flatten Playwright JSON-reporter output into failures.\nconst ctx = $('Pick results-json Artifact').first().json;\nconst buf = await this.helpers.getBinaryDataBuffer(0, 'data');\nconst files = unzip(buf);\nconst name = Object.keys(files).find((n) => /results\\.json$/.test(n));\nif (!name) throw new Error(`results.json not found in artifact (entries: ${Object.keys(files).join(', ')})`);\nconst report = JSON.parse(new TextDecoder().decode(files[name]));\nconst failures = [];\nlet total = 0;\nconst strip = (s) => String(s || '').replace(/\\u001b\\[[0-9;]*m/g, '');\nconst walk = (suite, filePath) => {\n  const file = suite.file || filePath;\n  for (const spec of suite.specs || []) {\n    for (const t of spec.tests || []) {\n      total += 1;\n      const statuses = (t.results || []).map((r) => r.status);\n      if (t.status === 'expected' || t.status === 'skipped') continue;\n      const results = t.results || [];\n      const last = results.slice(-1)[0] || {};\n      const failedRun = [...results].reverse().find((r) => r.status !== 'passed') || last;\n      const err = (failedRun.errors && failedRun.errors[0]) || failedRun.error || {};\n      failures.push({\n        title: spec.title,\n        file: `${file}:${spec.line || ''}`,\n        project: t.projectName,\n        outcome: t.status,\n        attempts: statuses,\n        passed_on_retry: t.status === 'flaky',\n        failed_all_retries: statuses.length > 0 && statuses.every((s) => s !== 'passed'),\n        error: strip(err.message).slice(0, 1500),\n        location: err.location ? `${err.location.file}:${err.location.line}` : '',\n        duration_ms: (t.results || []).reduce((a, r) => a + (r.duration || 0), 0),\n        attachments: (failedRun.attachments || []).map((x) => x.name),\n      });\n    }\n  }\n  for (const s of suite.suites || []) walk(s, file);\n};\nfor (const s of report.suites || []) walk(s, s.file);\nconst stats = report.stats || {};\nreturn [{ json: { ...ctx, total, failed: failures.length, stats, failures: failures.slice(0, 60), truncated: failures.length > 60 } }];\n"
+      }
+    },
+    {
+      "id": "7bd4cc3c-7f45-44df-86ae-804393406531",
+      "name": "Triage Input",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        2688,
+        960
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "ea9d504e-68ca-48db-b7bb-f230b962766c",
+      "name": "No results.json",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2464,
+        1024
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// The job failed before Playwright wrote results.json (install, checkout, runner, secrets...).\nconst ctx = $('Pick results-json Artifact').first().json;\nreturn [{ json: { ...ctx, total: 0, failed: 1, stats: {}, truncated: false, failures: [{ title: '(no results.json — job failed before tests ran)', file: '', project: '', outcome: 'unexpected', attempts: [], passed_on_retry: false, failed_all_retries: true, error: `No results-json artifact on run ${ctx.run_id}. See ${ctx.run_url}`, location: '', duration_ms: 0, attachments: [] }] } }];\n"
+      }
+    },
+    {
+      "id": "216f1919-62b5-4a85-bf38-18b5214cb5fc",
+      "name": "Jira · Open Bugs (dedupe)",
+      "type": "n8n-nodes-base.jira",
+      "typeVersion": 1,
+      "position": [
+        2912,
+        960
+      ],
+      "parameters": {
+        "jiraVersion": "cloud",
+        "resource": "issue",
+        "operation": "getAll",
+        "returnAll": false,
+        "limit": 50,
+        "options": {
+          "jql": "=project = \"{{ $(\"Config\").first().json.JIRA_PROJECT }}\" AND issuetype = Bug AND statusCategory != Done ORDER BY updated DESC",
+          "fields": "summary,labels,status,components"
+        }
+      },
+      "executeOnce": true,
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "alwaysOutputData": true
+    },
+    {
+      "id": "123f8f82-3ff1-445f-8d38-e4572add3c3b",
+      "name": "CI Failure Triage Agent",
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 3.1,
+      "position": [
+        3136,
+        960
+      ],
+      "parameters": {
+        "promptType": "define",
+        "text": "=Triage this failed qa-pr GitHub Actions run. Return STRICT JSON per the runtime contract.\n\nRUN:\n{{ JSON.stringify((({ run_id, run_attempt, run_url, conclusion, ticket, branch, head_sha, module, total, failed, stats, truncated }) => ({ run_id, run_attempt, run_url, conclusion, ticket, branch, head_sha, module, total, failed, stats, truncated }))($(\"Triage Input\").last().json), null, 1) }}\n\nFAILED TESTS (attempts = per-retry statuses):\n{{ JSON.stringify($(\"Triage Input\").last().json.failures, null, 1) }}\n\nOPEN JIRA BUGS (duplicate / known-issue check):\n{{ JSON.stringify($(\"Jira · Open Bugs (dedupe)\").all().filter(i => i.json.key).map(i => ({ key: i.json.key, summary: i.json.fields?.summary, labels: i.json.fields?.labels })), null, 1) }}",
+        "options": {
+          "systemMessage": "<!-- Source skill: failure-triage (SKILL.md body, verbatim) + n8n runtime contract appended below. -->\n\n\n# Failure Triage (SOP Stage 5 — Triage)\n\n## Input (any of)\n- GitHub Actions run URL or ID\n- `results/results.json` / `junit.xml`\n- Trace zip, logs, screenshots, or pasted error output\n\n## Step 1 — Collect\n- `gh run view <id> --log-failed`\n- `gh run download <id>` → read results.json, traces, screenshots\n- Per failed test capture: spec, test title, project/browser, error message, failing line, retry outcome, duration.\n\n## Step 2 — Group\nNormalize the error signature (strip IDs, timestamps, numbers). Same signature = one issue.\n\n## Step 3 — Classify each issue\n| Category | Signals |\n|---|---|\n| Product Bug | Assertion fails with wrong value/state; reproducible; fails on all retries; matches spec violation |\n| Test Bug | Locator not found after a UI change; wrong expectation vs current spec; bad test data setup; test-order dependence |\n| Flaky | Passed on retry; timing-related; fails intermittently across runs |\n| Environment | 5xx, DNS/network errors, ECONNREFUSED, auth/secret missing, browser install failure, timeouts across many unrelated tests |\n| Test Data | Seed missing, record already exists, data drift |\n| Known Issue | Matches an open Jira bug (search before concluding) |\n\nGive each a confidence score 0–1. If < 0.7 → mark `NEEDS HUMAN REVIEW`. Never label a failure Flaky if it failed on every retry.\n\n## Step 4 — Check for duplicates\nSearch Jira (JQL) by module + error keywords: `project = <KEY> AND type = Bug AND statusCategory != Done AND text ~ \"<keyword>\"`.\n\n## Step 5 — Route\n| Category | Action |\n|---|---|\n| Product Bug | Hand to `bug-report-writer` → Standard Bug Sheet + Jira |\n| Test Bug | Fix spec (POM/selector), then `code-review` gate |\n| Flaky | Tag `@flaky`, quarantine from gate, open a ticket, fix within 1 sprint |\n| Environment | Rerun once; if still failing, escalate to DevOps |\n| Test Data | Fix seed/fixture; rerun |\n| Known Issue | Link to existing Jira; no new bug |\n\n## Step 6 — Merge decision\n- BLOCK: any Product Bug, any S1/S2, or anything NEEDS HUMAN REVIEW\n- ALLOW AFTER FIX: Test Bug / Test Data only after fix + green rerun\n- ALLOW: Environment only after green rerun\n\n## Output format\n```\nRun: <id/url> | Total: X | Failed: Y | Unique issues: Z\nMERGE: BLOCK / ALLOW AFTER FIX / ALLOW\n\n| # | Test | Browser | Category | Confidence | Evidence | Action | Jira |\n|---|------|---------|----------|------------|----------|--------|------|\n\nNext steps:\n- ...\n```\n\n## Rules\n- Evidence for every classification: error line, trace step, or retry result.\n- Root cause stays a hypothesis unless confirmed (prefix `Hypothesis:`).\n- QA owns the final call; this skill drafts the triage.\n\n---\n\n# n8n Runtime Contract — Agent: CI Failure Triage (overrides anything above that conflicts)\n\nRuns in WF2 after a failed `qa-pr` GitHub Actions run. Input: parsed `results.json` failures (spec, title, project, error, retries, status per attempt), run metadata, and open Jira bugs for duplicate checking. You cannot run `gh` — all evidence is in the input.\n\n- Group by normalized error signature. Classify each group. Never label Flaky if it failed on every retry.\n- Confidence < 0.7 is allowed — the workflow routes it to human review automatically. Do not inflate confidence.\n- Prefix unconfirmed root causes with `Hypothesis:`.\n- `known_issue_key` = an existing Jira key from the input if the failure matches it, else null.\n\n## Output — STRICT JSON ONLY\n```json\n{\n  \"run_id\": \"123456\",\n  \"total\": 40,\n  \"failed\": 3,\n  \"merge_decision\": \"BLOCK\",\n  \"issues\": [\n    {\n      \"signature\": \"expect(locator).toHaveText: expected 'Paid' got 'Pending'\",\n      \"category\": \"ProductBug\",\n      \"confidence\": 0.86,\n      \"module\": \"checkout\",\n      \"tests\": [{ \"title\": \"TC-03 ... @PROJ-123\", \"file\": \"tests/e2e/proj-123/checkout.spec.ts\", \"project\": \"chromium\" }],\n      \"evidence\": \"failed 3/3 attempts; error line ...\",\n      \"hypothesis\": \"Hypothesis: ...\",\n      \"action\": \"File bug via bug-report-writer\",\n      \"known_issue_key\": null\n    }\n  ]\n}\n```\nAllowed `category`: ProductBug|TestBug|Flaky|Environment|TestData|KnownIssue. Allowed `merge_decision`: BLOCK|ALLOW_AFTER_FIX|ALLOW. `confidence` is a number 0–1.\n",
+          "maxIterations": 3
+        }
+      },
+      "executeOnce": true
+    },
+    {
+      "id": "c4406db0-08a6-4bc3-afca-f0c0c9607bf7",
+      "name": "Claude · Triage (t=0)",
+      "type": "@n8n/n8n-nodes-langchain.lmChatAnthropic",
+      "typeVersion": 1.6,
+      "position": [
+        3216,
+        1184
+      ],
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "mode": "id",
+          "value": "claude-sonnet-5-5"
+        },
+        "options": {
+          "temperature": 0,
+          "maxTokensToSample": 8000
+        }
+      }
+    },
+    {
+      "id": "4cdadb26-24ac-4e64-b38a-44e50bfdd5d9",
+      "name": "Validate Triage JSON",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3488,
+        960
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// shared strict-JSON helpers (prepended by n8n/build.py)\nfunction parseAgentJson(raw, label) {\n  if (raw && typeof raw === 'object') return raw;\n  if (typeof raw !== 'string' || !raw.trim()) throw new Error(`[${label}] empty/non-string agent output`);\n  let s = raw.trim();\n  const m = s.match(/^```(?:json)?\\s*([\\s\\S]*?)\\s*```$/i);\n  if (m) s = m[1].trim();\n  try { return JSON.parse(s); } catch (e) { throw new Error(`[${label}] invalid JSON (${e.message}): ${s.slice(0, 300)}`); }\n}\nfunction checkSchema(v, s, p, e) {\n  if (v === null || v === undefined) { if (!(s.nullable && v === null)) e.push(`${p} is ${v === null ? 'null' : 'missing'}`); return; }\n  const t = s.type;\n  if (t === 'any') return;\n  if (t === 'object') {\n    if (typeof v !== 'object' || Array.isArray(v)) return void e.push(`${p} must be an object`);\n    (s.required || []).forEach((k) => { if (!(k in v)) e.push(`${p}.${k} is required`); });\n    Object.entries(s.props || {}).forEach(([k, sub]) => { if (k in v) checkSchema(v[k], sub, `${p}.${k}`, e); });\n  } else if (t === 'array') {\n    if (!Array.isArray(v)) return void e.push(`${p} must be an array`);\n    if (s.minItems && v.length < s.minItems) e.push(`${p} needs >= ${s.minItems} items`);\n    if (s.items) v.forEach((x, i) => checkSchema(x, s.items, `${p}[${i}]`, e));\n  } else if (t === 'string') {\n    if (typeof v !== 'string') return void e.push(`${p} must be a string`);\n    if (s.minLength && v.length < s.minLength) e.push(`${p} too short`);\n    if (s.enum && !s.enum.includes(v)) e.push(`${p} must be one of ${s.enum.join('|')} (got \"${v}\")`);\n    if (s.pattern && !new RegExp(s.pattern).test(v)) e.push(`${p} must match /${s.pattern}/`);\n  } else if (t === 'number') {\n    if (typeof v !== 'number' || Number.isNaN(v)) return void e.push(`${p} must be a number`);\n    if (s.min !== undefined && v < s.min) e.push(`${p} must be >= ${s.min}`);\n    if (s.max !== undefined && v > s.max) e.push(`${p} must be <= ${s.max}`);\n  } else if (t === 'boolean') { if (typeof v !== 'boolean') e.push(`${p} must be a boolean`); }\n  else e.push(`${p}: unknown schema type ${t}`);\n}\nfunction assertSchema(v, s, label) {\n  const e = []; checkSchema(v, s, '$', e);\n  if (e.length) throw new Error(`[${label}] schema mismatch (${e.length}): ${e.slice(0, 12).join('; ')}`);\n  return v;\n}\n// end shared helpers\n\nconst ctx = $('Triage Input').last().json;\nconst triage = parseAgentJson($input.first().json.output, 'Triage');\nconst CATS = ['ProductBug', 'TestBug', 'Flaky', 'Environment', 'TestData', 'KnownIssue'];\nassertSchema(triage, {\n  type: 'object', required: ['run_id', 'total', 'failed', 'merge_decision', 'issues'],\n  props: {\n    merge_decision: { type: 'string', enum: ['BLOCK', 'ALLOW_AFTER_FIX', 'ALLOW'] },\n    total: { type: 'number', min: 0 }, failed: { type: 'number', min: 0 },\n    issues: {\n      type: 'array', minItems: 1,\n      items: {\n        type: 'object', required: ['signature', 'category', 'confidence', 'tests', 'evidence', 'action'],\n        props: {\n          category: { type: 'string', enum: CATS },\n          confidence: { type: 'number', min: 0, max: 1 },\n          tests: { type: 'array', minItems: 1, items: { type: 'object', required: ['title'] } },\n          evidence: { type: 'string', minLength: 1 },\n          known_issue_key: { type: 'string', nullable: true },\n        },\n      },\n    },\n  },\n}, 'Triage');\n// Skill rule: never Flaky if it failed on every retry.\nfor (const iss of triage.issues) {\n  if (iss.category === 'Flaky') {\n    const hits = ctx.failures.filter((f) => iss.tests.some((t) => t.title === f.title));\n    if (hits.length && hits.every((f) => f.failed_all_retries)) { iss.category = 'TestBug'; iss.confidence = Math.min(iss.confidence, 0.6); iss.evidence += ' [auto-corrected: failed on every retry, cannot be Flaky]'; }\n  }\n  iss.route = iss.confidence < 0.7 ? 'review'\n    : iss.category === 'ProductBug' ? 'product_bug'\n    : ['Flaky', 'TestBug', 'TestData'].includes(iss.category) ? 'task'\n    : iss.category === 'Environment' ? 'environment'\n    : iss.category === 'KnownIssue' && iss.known_issue_key ? 'known_issue' : 'review';\n}\n// Deterministic merge decision (SOP Stage 5, step 6) — the agent's value is kept for audit.\nconst routes = triage.issues.map((i) => i.route);\nconst merge = routes.some((r) => ['product_bug', 'review', 'known_issue'].includes(r)) ? 'BLOCK'\n  : routes.some((r) => r === 'task') ? 'ALLOW_AFTER_FIX'\n  : 'ALLOW';\nreturn [{ json: { ...ctx, triage, merge_decision: merge, agent_merge_decision: triage.merge_decision } }];\n"
+      }
+    },
+    {
+      "id": "f8e71dc7-d85b-4c50-b71c-0a754bce55a6",
+      "name": "One Item per Issue",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3712,
+        592
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const ctx = $input.first().json;\nreturn ctx.triage.issues.map((issue, idx) => ({\n  json: {\n    idx: idx + 1, issue, route: issue.route,\n    ticket: ctx.ticket, run_id: ctx.run_id, run_url: ctx.run_url, run_attempt: ctx.run_attempt,\n    head_sha: ctx.head_sha, branch: ctx.branch, module: issue.module || ctx.module, pr_url: ctx.pr_url,\n    failures: ctx.failures.filter((f) => issue.tests.some((t) => t.title === f.title)),\n  },\n}));\n"
+      }
+    },
+    {
+      "id": "86e9bcd1-8be3-4679-9b01-7d7d0ee83226",
+      "name": "Route Issue",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [
+        3936,
+        544
+      ],
+      "parameters": {
+        "mode": "rules",
+        "rules": {
+          "values": [
+            {
+              "renameOutput": true,
+              "outputKey": "ProductBug",
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.route }}",
+                    "rightValue": "product_bug",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "renameOutput": true,
+              "outputKey": "Flaky / TestBug / TestData",
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.route }}",
+                    "rightValue": "task",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "renameOutput": true,
+              "outputKey": "Environment",
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.route }}",
+                    "rightValue": "environment",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "renameOutput": true,
+              "outputKey": "KnownIssue",
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.route }}",
+                    "rightValue": "known_issue",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra",
+          "renameFallbackOutput": "Needs human review (conf < 0.7)"
+        }
+      }
+    },
+    {
+      "id": "f63c9f24-0665-4981-a5aa-8d525f3c4df3",
+      "name": "Bug Report Agent",
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 3.1,
+      "position": [
+        4160,
+        0
+      ],
+      "parameters": {
+        "promptType": "define",
+        "text": "=Write the bug report for this triaged ProductBug. Return STRICT JSON per the runtime contract.\n\nTICKET UNDER TEST: {{ $json.ticket }}\nMODULE: {{ $json.module }}\nCI RUN: {{ $json.run_url }} (attempt {{ $json.run_attempt }})\nBUILD (commit): {{ $json.head_sha }}\nPR: {{ $json.pr_url || \"n/a\" }}\nTODAY (Asia/Karachi): {{ $now.setZone(\"Asia/Karachi\").toFormat(\"yyyy-MM-dd\") }}\n\nTRIAGE ISSUE:\n{{ JSON.stringify($json.issue, null, 1) }}\n\nFAILED TEST EVIDENCE:\n{{ JSON.stringify($json.failures, null, 1) }}",
+        "options": {
+          "systemMessage": "<!-- Source skill: asadullahkhan-bug-report-writer (SKILL.md body, verbatim) + n8n runtime contract appended below. -->\n\n\n# Bug Report Writer\n\nBad bug reports waste engineering time. Good ones get bugs fixed fast. This skill produces the latter.\n\n## Required structure — always use this template\n\n```markdown\n# [BUG] <Concise one-line summary — what's broken, where>\n\n## Summary\n<2-3 sentences. What is broken, under what conditions, and what's the user impact.>\n\n## Severity & Priority\n**Severity:** <S1 Critical | S2 Major | S3 Minor | S4 Trivial>\n**Priority:** <P0 Now | P1 Next sprint | P2 Backlog | P3 Nice-to-fix>\n**Rationale:** <one line justifying the classification>\n\n## Environment\n- **Application:** <app name + version/build>\n- **Environment:** <Prod | Staging | QA | Local>\n- **Browser/Device:** <Chrome 138 on macOS 15.2 | iPhone 15 Pro iOS 18 | N/A>\n- **URL/Endpoint:** <specific URL or API endpoint if applicable>\n- **User role/account:** <if auth-dependent>\n- **Timestamp (first observed):** <ISO 8601 + timezone>\n\n## Reproduction steps\n1. <Numbered, atomic, deterministic steps>\n2. <Each step should be one action a human or automation can perform>\n3. <Include exact input values, not \"some text\">\n\n**Reproduction rate:** <100% | Intermittent (~X%) | Once, could not reproduce>\n**Pre-conditions:** <any state setup required before step 1>\n\n## Expected result\n<What should happen, per requirement/spec. Link to the spec if possible.>\n\n## Actual result\n<What actually happens. Be specific — \"it breaks\" is not a result. Include exact error text, incorrect data, wrong UI state, etc.>\n\n## Evidence\n- **Screenshots:** <paths or links>\n- **Screen recording:** <link if applicable>\n- **Network HAR / request-response:** <attach or paste relevant request>\n- **Logs:** <paste relevant log excerpt in code block with timestamps>\n- **Stack trace:** <paste in code block>\n\n## Root cause hypothesis\n<If you can reasonably hypothesize — not speculation, but \"based on the stack trace, this looks like a NullPointerException in the user-avatar resolver when the user has no uploaded image\". Prefix with \"Hypothesis:\" so it's clearly not confirmed.>\n\n## Suggested regression tests\n<2-3 test cases to add so this doesn't come back. Reference existing test suite location if known.>\n\n## Related\n- **Similar issues:** <links to Jira/GitHub issues that might be related>\n- **Affected features:** <other areas of the product that might share the root cause>\n- **Blocking/blocked by:** <ticket keys>\n```\n\n## Severity definitions (do not fudge these)\n\n- **S1 Critical** — Data loss, security vulnerability, production down, no workaround, affects all users or majority of users\n- **S2 Major** — Core feature broken, significant user impact, workaround exists but painful\n- **S3 Minor** — Non-core feature broken or degraded, easy workaround, affects limited users\n- **S4 Trivial** — Cosmetic, typo, minor UI glitch, no functional impact\n\n## Priority vs. Severity\n\nSeverity is technical impact. Priority is business urgency. They are not the same. A cosmetic bug on the CEO's vanity page is S4 but might be P0. A crash in an unused feature is S1 but might be P2. Classify both independently and justify.\n\n## Reproduction steps — the non-negotiable rules\n\n1. **Start from a known state.** \"Log in as admin\" not \"while logged in\".\n2. **One action per step.** \"Click X, then Y\" is two steps.\n3. **Exact values.** \"Enter 'test@example.com'\" not \"enter an email\".\n4. **Include wait conditions.** \"Wait for the dashboard to load (spinner disappears)\".\n5. **Specify where clicks happen.** \"Click the 'Submit' button in the modal header\" not just \"click submit\".\n6. **Numbered, not bulleted.** Numbers imply order; bullets don't.\n\nA bug report where the dev can't reproduce is a bug report that gets closed as \"cannot reproduce\" and comes back later. Treat reproduction steps as the most important section.\n\n## Handling different input types\n\n### User pastes an error / stack trace\n- Extract the actual error message and class/type\n- Identify the originating file and line from the stack\n- Propose a root cause hypothesis if the stack is clear enough\n- Ask for reproduction steps if they're not provided — don't guess\n\n### User describes behavior informally\n- Convert to structured steps\n- Fill in gaps by asking specific questions (environment, browser, user role, data state)\n- Never fabricate details. If you don't know the browser, write `<UNKNOWN — please fill in>` and ask.\n\n### User pastes a failed test output (Playwright, Pytest, Jest, etc.)\n- Extract the test name, assertion that failed, expected vs. actual\n- Include the test file path and line\n- Include any screenshots/traces Playwright/Cypress captured\n- Note whether it's flaky (mention retry behavior if visible)\n\n### User provides a screenshot\n- Describe what the screenshot shows, don't rely on the reader having seen it\n- Call out the specific element that's wrong and what's expected there\n- If the screenshot has a URL bar, extract and include it in the environment section\n\n## Severity triage aid\n\nAsk yourself, in order:\n1. Is data being lost or corrupted? → S1\n2. Is there a security exposure? → S1\n3. Is the core user flow broken for all/most users? → S1\n4. Is a major feature broken with no workaround? → S2\n5. Is a feature broken but usable via workaround? → S2/S3\n6. Is it only cosmetic? → S4\n\n## MCP integrations\n\n- **Atlassian (Jira)**: After generating the report, offer to create the Jira issue directly. Ask for the project key and issue type first. Creating the ticket requires explicit permission.\n- **Atlassian (Confluence)**: For long-form incident reports, offer to publish as a Confluence page under a specified space.\n- **Microsoft 365 (Outlook)**: For bugs that need stakeholder notification, offer to draft the notification email (use the `message_compose_v1` tool shape).\n- **Fireflies / Granola**: If the bug was discussed in a meeting, pull the relevant transcript excerpt as additional context in the \"Related\" section.\n\n## Quality gates\n\nBefore returning, self-check:\n- [ ] Summary is one line and readable in a ticket list\n- [ ] Severity and priority are both set with rationale\n- [ ] Reproduction steps are deterministic and numbered\n- [ ] Expected vs. actual are both concrete and specific\n- [ ] At least one piece of evidence is included (or explicitly requested from user)\n- [ ] No placeholder text like \"TBD\" or \"N/A\" without explanation\n\n## Anti-patterns to flag in user's original description\n\nIf the user's informal description has any of these, fix them in the output and briefly note what you improved:\n- \"Sometimes it doesn't work\" → push for reproduction rate and conditions\n- \"It's slow\" → ask for baseline and measurement (ms, s)\n- \"The UI is broken\" → ask which element, which breakpoint\n- \"It crashed\" → ask for error message, log excerpt, timestamp\n\n## Tone\n\nNeutral, factual, no blame. Bug reports are not the place for editorializing (\"this is stupid\"), accusation (\"who wrote this?\"), or speculation presented as fact. Stick to observed behavior and evidence.\n\n---\n\n# n8n Runtime Contract — Agent: Bug Report (overrides anything above that conflicts)\n\nRuns in WF2 for each triage issue with category ProductBug and confidence ≥ 0.7. Input: the triage issue, run URL, artifact evidence, ticket under test. Unattended; you cannot ask questions — write `<UNKNOWN — please fill in>` for facts not in the input. Never fabricate.\n\n`markdown` = the full report using the \"Required structure\" template above. `sheet_row` = the **Standard Bug Sheet** fields (one row per bug).\n\n## Output — STRICT JSON ONLY\n```json\n{\n  \"title\": \"[BUG] Order status stays 'Pending' after successful payment\",\n  \"summary\": \"...\",\n  \"severity\": \"S2\",\n  \"priority\": \"P1\",\n  \"rationale\": \"...\",\n  \"module\": \"checkout\",\n  \"environment\": { \"application\": \"...\", \"environment\": \"QA\", \"browser\": \"chromium\", \"url\": \"...\", \"build\": \"<commit sha>\" },\n  \"steps\": [\"1 ...\", \"2 ...\"],\n  \"reproduction_rate\": \"100% (3/3 CI attempts)\",\n  \"preconditions\": \"...\",\n  \"expected\": \"...\",\n  \"actual\": \"...\",\n  \"evidence\": [\"<run url>\", \"<trace path>\"],\n  \"hypothesis\": \"Hypothesis: ...\",\n  \"regression_tests\": [\"...\"],\n  \"markdown\": \"# [BUG] ...\",\n  \"sheet_row\": {\n    \"Bug ID\": \"\", \"Jira Key\": \"\", \"Title\": \"\", \"Module\": \"\", \"Severity\": \"S2\", \"Priority\": \"P1\",\n    \"Status\": \"Open\", \"Environment\": \"QA\", \"Browser\": \"chromium\", \"Build\": \"\", \"Steps\": \"\", \"Expected\": \"\", \"Actual\": \"\",\n    \"Evidence\": \"\", \"Reported Date\": \"YYYY-MM-DD\", \"Reported By\": \"QA Automation (n8n)\", \"Source Ticket\": \"\",\n    \"CI Run\": \"\", \"Verified Date\": \"\", \"Verified By\": \"\", \"Regression Test ID\": \"\"\n  }\n}\n```\nAllowed `severity`: S1|S2|S3|S4. Allowed `priority`: P0|P1|P2|P3. Leave `Bug ID` and `Jira Key` empty — the workflow fills them after creating the Jira issue.\n",
+          "maxIterations": 3
+        }
+      }
+    },
+    {
+      "id": "beb9968d-0cb7-4e46-955c-d79e06f08867",
+      "name": "Claude · Bug Report (t=0)",
+      "type": "@n8n/n8n-nodes-langchain.lmChatAnthropic",
+      "typeVersion": 1.6,
+      "position": [
+        4240,
+        224
+      ],
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "mode": "id",
+          "value": "claude-sonnet-5-5"
+        },
+        "options": {
+          "temperature": 0,
+          "maxTokensToSample": 6000
+        }
+      }
+    },
+    {
+      "id": "f19d0a8a-2b36-4840-a642-f13114d5830b",
+      "name": "Validate Bug JSON",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4512,
+        112
+      ],
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// shared strict-JSON helpers (prepended by n8n/build.py)\nfunction parseAgentJson(raw, label) {\n  if (raw && typeof raw === 'object') return raw;\n  if (typeof raw !== 'string' || !raw.trim()) throw new Error(`[${label}] empty/non-string agent output`);\n  let s = raw.trim();\n  const m = s.match(/^```(?:json)?\\s*([\\s\\S]*?)\\s*```$/i);\n  if (m) s = m[1].trim();\n  try { return JSON.parse(s); } catch (e) { throw new Error(`[${label}] invalid JSON (${e.message}): ${s.slice(0, 300)}`); }\n}\nfunction checkSchema(v, s, p, e) {\n  if (v === null || v === undefined) { if (!(s.nullable && v === null)) e.push(`${p} is ${v === null ? 'null' : 'missing'}`); return; }\n  const t = s.type;\n  if (t === 'any') return;\n  if (t === 'object') {\n    if (typeof v !== 'object' || Array.isArray(v)) return void e.push(`${p} must be an object`);\n    (s.required || []).forEach((k) => { if (!(k in v)) e.push(`${p}.${k} is required`); });\n    Object.entries(s.props || {}).forEach(([k, sub]) => { if (k in v) checkSchema(v[k], sub, `${p}.${k}`, e); });\n  } else if (t === 'array') {\n    if (!Array.isArray(v)) return void e.push(`${p} must be an array`);\n    if (s.minItems && v.length < s.minItems) e.push(`${p} needs >= ${s.minItems} items`);\n    if (s.items) v.forEach((x, i) => checkSchema(x, s.items, `${p}[${i}]`, e));\n  } else if (t === 'string') {\n    if (typeof v !== 'string') return void e.push(`${p} must be a string`);\n    if (s.minLength && v.length < s.minLength) e.push(`${p} too short`);\n    if (s.enum && !s.enum.includes(v)) e.push(`${p} must be one of ${s.enum.join('|')} (got \"${v}\")`);\n    if (s.pattern && !new RegExp(s.pattern).test(v)) e.push(`${p} must match /${s.pattern}/`);\n  } else if (t === 'number') {\n    if (typeof v !== 'number' || Number.isNaN(v)) return void e.push(`${p} must be a number`);\n    if (s.min !== undefined && v < s.min) e.push(`${p} must be >= ${s.min}`);\n    if (s.max !== undefined && v > s.max) e.push(`${p} must be <= ${s.max}`);\n  } else if (t === 'boolean') { if (typeof v !== 'boolean') e.push(`${p} must be a boolean`); }\n  else e.push(`${p}: unknown schema type ${t}`);\n}\nfunction assertSchema(v, s, label) {\n  const e = []; checkSchema(v, s, '$', e);\n  if (e.length) throw new Error(`[${label}] schema mismatch (${e.length}): ${e.slice(0, 12).join('; ')}`);\n  return v;\n}\n// end shared helpers\n\nconst ctx = $('Route Issue').item.json;\nconst bug = parseAgentJson($input.item.json.output, 'Bug Report');\nassertSchema(bug, {\n  type: 'object',\n  required: ['title', 'summary', 'severity', 'priority', 'rationale', 'module', 'environment', 'steps', 'reproduction_rate', 'expected', 'actual', 'evidence', 'hypothesis', 'markdown', 'sheet_row'],\n  props: {\n    title: { type: 'string', pattern: '^\\\\[BUG\\\\] ' },\n    severity: { type: 'string', enum: ['S1', 'S2', 'S3', 'S4'] },\n    priority: { type: 'string', enum: ['P0', 'P1', 'P2', 'P3'] },\n    steps: { type: 'array', minItems: 1, items: { type: 'string' } },\n    evidence: { type: 'array', minItems: 1, items: { type: 'string' } },\n    markdown: { type: 'string', minLength: 50 },\n    sheet_row: { type: 'object', required: ['Title', 'Module', 'Severity', 'Priority', 'Status', 'Steps', 'Expected', 'Actual'] },\n  },\n}, 'Bug Report');\nconst jiraPriority = { P0: 'Highest', P1: 'High', P2: 'Medium', P3: 'Low' }[bug.priority];\nreturn { json: { ...ctx, bug, jira_priority: jiraPriority } };\n"
+      }
+    },
+    {
+      "id": "ac173aa3-1597-47a7-9dff-392f9773588c",
+      "name": "Jira · Create Bug",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        4736,
+        112
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $(\"Config\").first().json.JIRA_BASE_URL.replace(/\\/$/, \"\") }}/rest/api/2/issue",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "jiraSoftwareCloudApi",
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ fields: { project: { key: $(\"Config\").first().json.JIRA_PROJECT }, issuetype: { name: \"Bug\" }, summary: $json.bug.title.replace(/^\\[BUG\\]\\s*/, \"\").slice(0, 250), description: $json.bug.markdown + \"\\n\\n----\\nSeverity: \" + $json.bug.severity + \" · Priority: \" + $json.bug.priority + \" (\" + $json.jira_priority + \")\\nFiled by n8n QA | CI Result & Triage from \" + $json.run_url, labels: [\"qa-automation\", \"ci-triage\", $json.module].filter(Boolean) } }) }}",
+        "options": {
+          "timeout": 60000
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "id": "f8c87f45-b30d-410c-a342-ce612a3eaddb",
+      "name": "Build Bug Sheet Row",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4960,
+        112
+      ],
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Standard Bug Sheet row, completed with the Jira key returned by the create call.\nconst src = $('Validate Bug JSON').item.json;\nconst key = $input.item.json.key;\nconst today = $now.setZone('Asia/Karachi').toFormat('yyyy-MM-dd');\nreturn { json: { ...src.bug.sheet_row, 'Bug ID': key, 'Jira Key': key, 'Status': 'Open', 'Reported Date': src.bug.sheet_row['Reported Date'] && !/Y/.test(src.bug.sheet_row['Reported Date']) ? src.bug.sheet_row['Reported Date'] : today, 'Source Ticket': src.ticket, 'CI Run': src.run_url, 'Build': src.head_sha } };\n"
+      }
+    },
+    {
+      "id": "b4787c25-4acd-4213-8365-f5a9971fd590",
+      "name": "Bug Sheet · Append Row",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        5184,
+        112
+      ],
+      "parameters": {
+        "resource": "sheet",
+        "operation": "append",
+        "authentication": "oAuth2",
+        "documentId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "={{ $(\"Config\").first().json.BUG_SHEET_ID }}"
+        },
+        "sheetName": {
+          "__rl": true,
+          "mode": "name",
+          "value": "={{ $(\"Config\").first().json.BUG_SHEET_TAB }}"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {}
+        },
+        "options": {
+          "handlingExtraData": "ignoreIt"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "id": "2737deb0-f4b1-4943-9f6a-b8f69271ff15",
+      "name": "Jira · Create Task (flaky / test-bug)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        4224,
+        400
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $(\"Config\").first().json.JIRA_BASE_URL.replace(/\\/$/, \"\") }}/rest/api/2/issue",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "jiraSoftwareCloudApi",
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ fields: { project: { key: $(\"Config\").first().json.JIRA_PROJECT }, issuetype: { name: \"Task\" }, summary: (\"[\" + $json.issue.category + \"] \" + ($json.issue.tests[0]?.title || $json.issue.signature)).slice(0, 250), description: \"CI run: \" + $json.run_url + \"\\nSource ticket: \" + $json.ticket + \"\\nConfidence: \" + $json.issue.confidence + \"\\n\\nEvidence: \" + $json.issue.evidence + \"\\n\" + ($json.issue.hypothesis || \"\") + \"\\n\\nAction: \" + $json.issue.action + \"\\nTests:\\n\" + $json.issue.tests.map(t => \"- \" + t.title + \" (\" + (t.project || \"\") + \") \" + (t.file || \"\")).join(\"\\n\") + \"\\n\\nSOP: Flaky → tag @flaky, quarantine from the gate, fix within 1 sprint. TestBug → fix spec (POM/selector) and re-run the review gate.\", labels: [\"qa-automation\", { Flaky: \"flaky\", TestBug: \"test-bug\", TestData: \"test-data\" }[$json.issue.category], $json.module].filter(Boolean) } }) }}",
+        "options": {
+          "timeout": 60000
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "id": "99af6c21-c2fa-4cf9-9c9c-d0bd0472058f",
+      "name": "First Attempt? (re-run once)",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        4224,
+        592
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ Number($json.run_attempt) }}",
+              "rightValue": 2,
+              "operator": {
+                "type": "number",
+                "operation": "lt"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      }
+    },
+    {
+      "id": "f74d638b-30d6-444d-9d0e-f699b3cb874c",
+      "name": "GitHub · Re-run Failed Jobs",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        4512,
+        448
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "=https://api.github.com/repos/{{ $(\"Config\").first().json.GITHUB_OWNER }}/{{ $(\"Config\").first().json.GITHUB_REPO }}/actions/runs/{{ $json.run_id }}/rerun-failed-jobs",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "githubApi",
+        "sendHeaders": true,
+        "specifyHeaders": "keypair",
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Accept",
+              "value": "application/vnd.github+json"
+            },
+            {
+              "name": "X-GitHub-Api-Version",
+              "value": "2022-11-28"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 60000
+        }
+      },
+      "executeOnce": true,
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "id": "29cbe276-7857-4978-9fa0-e375ce2a9221",
+      "name": "Slack · Env Failure Persists",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.7,
+      "position": [
+        4512,
+        688
+      ],
+      "parameters": {
+        "resource": "message",
+        "operation": "post",
+        "authentication": "accessToken",
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "mode": "name",
+          "value": "={{ $(\"Config\").first().json.SLACK_CHANNEL }}"
+        },
+        "messageType": "text",
+        "text": "=:rotating_light: *Environment failure persists after re-run* — {{ $json.ticket }} · <{{ $json.run_url }}|run {{ $json.run_id }}> (attempt {{ $json.run_attempt }})\n{{ $json.issue.signature }}\nEscalate to DevOps (SOP Stage 5)."
+      },
+      "executeOnce": true,
+      "webhookId": "37aa83a1-0fbc-44e4-9111-47f5631de2c1"
+    },
+    {
+      "id": "217286db-f49e-4dc3-b950-4ffc39b4e653",
+      "name": "Jira · Link to Known Issue",
+      "type": "n8n-nodes-base.jira",
+      "typeVersion": 1,
+      "position": [
+        4224,
+        784
+      ],
+      "parameters": {
+        "jiraVersion": "cloud",
+        "resource": "issueComment",
+        "operation": "add",
+        "issueKey": "={{ $json.issue.known_issue_key }}",
+        "comment": "=Seen again by QA automation (no new bug filed): {{ $json.issue.tests.map(t => t.title).join(\"; \") }}\nCI run: {{ $json.run_url }} · source ticket {{ $json.ticket }}\nEvidence: {{ $json.issue.evidence }}"
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "id": "187e4cfb-a3f7-411c-beea-70b79e0e02a2",
+      "name": "Slack · Needs Human Review",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.7,
+      "position": [
+        4224,
+        976
+      ],
+      "parameters": {
+        "resource": "message",
+        "operation": "post",
+        "authentication": "accessToken",
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "mode": "name",
+          "value": "={{ $(\"Config\").first().json.SLACK_CHANNEL }}"
+        },
+        "messageType": "text",
+        "text": "=:mag: *Needs human review* — {{ $json.ticket }} · <{{ $json.run_url }}|run {{ $json.run_id }}>\nCategory guess: {{ $json.issue.category }} (confidence {{ $json.issue.confidence }})\nTests: {{ $json.issue.tests.map(t => t.title).join(\"; \") }}\nEvidence: {{ $json.issue.evidence }}\n{{ $json.issue.hypothesis || \"\" }}"
+      },
+      "webhookId": "0b23203e-8cc5-46aa-8f76-e0a4d0a91c1a"
+    },
+    {
+      "id": "ee3cbebc-64bd-4a72-9975-f2521b72ee78",
+      "name": "Build Triage Summary",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3712,
+        832
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const ctx = $input.first().json;\nconst icon = { BLOCK: ':no_entry:', ALLOW_AFTER_FIX: ':warning:', ALLOW: ':white_check_mark:' }[ctx.merge_decision];\nconst pad = (s, n) => String(s ?? '').slice(0, n).padEnd(n);\nconst rows = ctx.triage.issues.map((i, k) => `${pad(k + 1, 2)} ${pad(i.category, 11)} ${pad(i.confidence.toFixed(2), 4)} ${pad(i.route, 12)} ${pad(i.tests[0]?.title, 46)}`);\nconst text = `${icon} *qa-pr triage* — ${ctx.ticket || ctx.head_branch} · <${ctx.run_url}|run ${ctx.run_id}> (attempt ${ctx.run_attempt})\\n` +\n  `Total ${ctx.total} · Failed ${ctx.failed} · Unique issues ${ctx.triage.issues.length}\\n` +\n  '```\\n# Category    Conf Route        Test\\n' + rows.join('\\n') + '\\n```\\n' +\n  `*MERGE: ${ctx.merge_decision}*` + (ctx.agent_merge_decision !== ctx.merge_decision ? ` (agent suggested ${ctx.agent_merge_decision})` : '') +\n  (ctx.pr_url ? `\\nPR: ${ctx.pr_url}` : '') + '\\nQA owns the final call — nothing is merged or closed automatically.';\nreturn [{ json: { ...ctx, slack_text: text } }];\n"
+      }
+    },
+    {
+      "id": "9df64272-9d7f-4b15-9cc4-285b119399b1",
+      "name": "Slack · Triage Summary",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.7,
+      "position": [
+        3936,
+        832
+      ],
+      "parameters": {
+        "resource": "message",
+        "operation": "post",
+        "authentication": "accessToken",
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "mode": "name",
+          "value": "={{ $(\"Config\").first().json.SLACK_CHANNEL }}"
+        },
+        "messageType": "text",
+        "text": "={{ $json.slack_text }}"
+      },
+      "webhookId": "9a05ac71-4a4a-4f75-b405-149d25d15a56"
+    },
+    {
+      "id": "fe7afd19-16ee-4efa-b98d-af24518a2b82",
+      "name": "Jira · Comment Triage on Ticket",
+      "type": "n8n-nodes-base.jira",
+      "typeVersion": 1,
+      "position": [
+        3712,
+        1024
+      ],
+      "parameters": {
+        "jiraVersion": "cloud",
+        "resource": "issueComment",
+        "operation": "add",
+        "issueKey": "={{ $json.ticket }}",
+        "comment": "=QA automation ❌ qa-pr failed — MERGE: {{ $json.merge_decision }}\nRun: {{ $json.run_url }} (attempt {{ $json.run_attempt }})\n{{ $json.triage.issues.map((i, k) => (k + 1) + \". [\" + i.category + \" \" + i.confidence + \"] \" + i.tests.map(t => t.title).join(\"; \") + \" — \" + i.action).join(\"\\n\") }}"
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "id": "5dfa74b7-e233-4b46-b203-2adaee31ac8d",
+      "name": "qa_runs · Record Failed + Decision",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        3712,
+        1216
+      ],
+      "parameters": {
+        "resource": "row",
+        "operation": "upsert",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "9mMnRlpTU4S4ezRU",
+          "cachedResultName": "qa_runs"
+        },
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "dispatch_id",
+              "condition": "eq",
+              "keyValue": "={{ $json.row_key }}"
+            }
+          ]
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "ticket": "={{ $json.ticket }}",
+            "branch": "={{ $json.branch }}",
+            "pr_url": "={{ $json.pr_url }}",
+            "run_id": "={{ $json.run_id }}",
+            "status": "failed",
+            "kind": "={{ $json.kind }}",
+            "dispatch_id": "={{ $json.row_key }}",
+            "conclusion": "={{ $json.conclusion }}",
+            "merge_decision": "={{ $json.merge_decision }}",
+            "module": "={{ $json.module }}"
+          },
+          "schema": [
+            {
+              "id": "ticket",
+              "displayName": "ticket",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "branch",
+              "displayName": "branch",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "pr_url",
+              "displayName": "pr_url",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "run_id",
+              "displayName": "run_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "status",
+              "displayName": "status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "kind",
+              "displayName": "kind",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "dispatch_id",
+              "displayName": "dispatch_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "conclusion",
+              "displayName": "conclusion",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "merge_decision",
+              "displayName": "merge_decision",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "module",
+              "displayName": "module",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "connections": {
+    "GitHub workflow_run Webhook": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Config": {
+      "main": [
+        [
+          {
+            "node": "Verify Signature & Filter",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verify Signature & Filter": {
+      "main": [
+        [
+          {
+            "node": "qa_runs · Find Run Row",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "qa_runs · Find Run Row": {
+      "main": [
+        [
+          {
+            "node": "Run Context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run Context": {
+      "main": [
+        [
+          {
+            "node": "Fix-Verification Run?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fix-Verification Run?": {
+      "main": [
+        [
+          {
+            "node": "qa_runs · Record Verification Result",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Route by Conclusion",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route by Conclusion": {
+      "main": [
+        [
+          {
+            "node": "CI Passed",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "GitHub · List Run Artifacts",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "qa_runs · Record Cancelled/Other",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "CI Passed": {
+      "main": [
+        [
+          {
+            "node": "Jira · Comment CI Passed",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Slack · CI Passed",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "qa_runs · Record Passed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GitHub · List Run Artifacts": {
+      "main": [
+        [
+          {
+            "node": "Pick results-json Artifact",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pick results-json Artifact": {
+      "main": [
+        [
+          {
+            "node": "Has results.json?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has results.json?": {
+      "main": [
+        [
+          {
+            "node": "GitHub · Download results-json.zip",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "No results.json",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GitHub · Download results-json.zip": {
+      "main": [
+        [
+          {
+            "node": "Unzip & Parse results.json",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Unzip & Parse results.json": {
+      "main": [
+        [
+          {
+            "node": "Triage Input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Triage Input": {
+      "main": [
+        [
+          {
+            "node": "Jira · Open Bugs (dedupe)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "No results.json": {
+      "main": [
+        [
+          {
+            "node": "Triage Input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Jira · Open Bugs (dedupe)": {
+      "main": [
+        [
+          {
+            "node": "CI Failure Triage Agent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "CI Failure Triage Agent": {
+      "main": [
+        [
+          {
+            "node": "Validate Triage JSON",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claude · Triage (t=0)": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "CI Failure Triage Agent",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Triage JSON": {
+      "main": [
+        [
+          {
+            "node": "One Item per Issue",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Build Triage Summary",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Jira · Comment Triage on Ticket",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "qa_runs · Record Failed + Decision",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "One Item per Issue": {
+      "main": [
+        [
+          {
+            "node": "Route Issue",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route Issue": {
+      "main": [
+        [
+          {
+            "node": "Bug Report Agent",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Jira · Create Task (flaky / test-bug)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "First Attempt? (re-run once)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Jira · Link to Known Issue",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Slack · Needs Human Review",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Bug Report Agent": {
+      "main": [
+        [
+          {
+            "node": "Validate Bug JSON",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claude · Bug Report (t=0)": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Bug Report Agent",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Bug JSON": {
+      "main": [
+        [
+          {
+            "node": "Jira · Create Bug",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Jira · Create Bug": {
+      "main": [
+        [
+          {
+            "node": "Build Bug Sheet Row",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Bug Sheet Row": {
+      "main": [
+        [
+          {
+            "node": "Bug Sheet · Append Row",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "First Attempt? (re-run once)": {
+      "main": [
+        [
+          {
+            "node": "GitHub · Re-run Failed Jobs",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Slack · Env Failure Persists",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Triage Summary": {
+      "main": [
+        [
+          {
+            "node": "Slack · Triage Summary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "availableInMCP": true
+  },
+  "id": "wJkkoDr16zW22l65",
+  "active": false,
+  "description": "Sprint QA Automation WF2: GitHub workflow_run webhook (HMAC verified) → success: Jira/Slack/qa_runs; failure: unzip results.json → Triage agent → ProductBug→Bug Report agent→Jira Bug+Bug Sheet, Flaky/TestBug→Jira Task, Environment→re-run once, low confide",
+  "nodeGroups": [
+    {
+      "id": "7b63d197-0f2a-415a-9096-ef8266d703a1",
+      "name": "Receive & verify",
+      "nodeNames": [
+        "Config",
+        "Verify Signature & Filter",
+        "qa_runs · Find Run Row",
+        "Run Context"
+      ],
+      "description": "Config, HMAC-SHA256 check of X-Hub-Signature-256 over the raw body, keep completed qa-pr.yml runs, join qa_runs row"
+    },
+    {
+      "id": "7c018a15-851c-4ada-9a5e-7e4ce5a7989d",
+      "name": "CI passed",
+      "nodeNames": [
+        "CI Passed",
+        "Jira · Comment CI Passed",
+        "Slack · CI Passed",
+        "qa_runs · Record Passed"
+      ],
+      "description": "Jira comment, Slack ✅ and qa_runs status=passed, merge ALLOW (a human still approves and merges)"
+    },
+    {
+      "id": "0bcbec92-3f66-4176-942c-e2b709ae873a",
+      "name": "Collect results",
+      "nodeNames": [
+        "GitHub · List Run Artifacts",
+        "Pick results-json Artifact",
+        "Has results.json?",
+        "GitHub · Download results-json.zip",
+        "Unzip & Parse results.json",
+        "No results.json",
+        "Triage Input"
+      ],
+      "description": "Download the results-json artifact and unzip it in a Code node (pure JS inflate); handles runs with no results"
+    },
+    {
+      "id": "e745a952-19af-47c4-8dc3-f1493309c4f7",
+      "name": "Triage",
+      "nodeNames": [
+        "Jira · Open Bugs (dedupe)",
+        "CI Failure Triage Agent",
+        "Claude · Triage (t=0)",
+        "Validate Triage JSON"
+      ],
+      "description": "Open-bug dedupe, failure-triage agent (t=0), strict JSON check, Flaky guard, deterministic merge decision"
+    },
+    {
+      "id": "8a0e07e6-0dcd-4472-9b09-bea3c4f7db5d",
+      "name": "Route & report",
+      "nodeNames": [
+        "One Item per Issue",
+        "Route Issue",
+        "Bug Report Agent",
+        "Claude · Bug Report (t=0)",
+        "Validate Bug JSON",
+        "Jira · Create Bug",
+        "Build Bug Sheet Row",
+        "Bug Sheet · Append Row",
+        "Jira · Create Task (flaky / test-bug)",
+        "First Attempt? (re-run once)",
+        "GitHub · Re-run Failed Jobs",
+        "Slack · Env Failure Persists",
+        "Jira · Link to Known Issue",
+        "Slack · Needs Human Review"
+      ],
+      "description": "ProductBug → Bug Report agent → Jira Bug + Bug Sheet; Flaky/TestBug → Jira Task; Env → re-run once; low conf → Slack"
+    },
+    {
+      "id": "7ed3d66d-5c33-42e2-a79d-4b3a730bd7f0",
+      "name": "Summary",
+      "nodeNames": [
+        "Build Triage Summary",
+        "Slack · Triage Summary"
+      ],
+      "description": "Slack triage table with MERGE BLOCK / ALLOW_AFTER_FIX / ALLOW"
+    }
+  ],
+  "pinData": {},
+  "meta": {
+    "exportedFrom": "n8n draft, versionId 1b22245d-176d-43a9-bee6-499cae638798"
+  }
+}

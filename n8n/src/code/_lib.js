@@ -37,14 +37,4 @@ function assertSchema(v, s, label) {
   if (e.length) throw new Error(`[${label}] schema mismatch (${e.length}): ${e.slice(0, 12).join('; ')}`);
   return v;
 }
-const FILE_SCHEMA = { type: 'object', required: ['path', 'content'], props: { path: { type: 'string', minLength: 1 }, content: { type: 'string', minLength: 1 } } };
-function assertFiles(files, prefixes, label) {
-  for (const f of files) {
-    const p = f.path;
-    if (p.includes('..') || p.startsWith('/') || p.includes('\\') || !prefixes.some((x) => p.startsWith(x))) throw new Error(`[${label}] path not allowed: "${p}" (allowed: ${prefixes.join(', ')})`);
-    if (!p.endsWith('.ts')) throw new Error(`[${label}] only .ts files allowed: "${p}"`);
-    if (/waitForTimeout\s*\(|setTimeout\s*\(/.test(f.content)) throw new Error(`[${label}] hard sleep found in ${p}`);
-  }
-  return files;
-}
 // end shared helpers

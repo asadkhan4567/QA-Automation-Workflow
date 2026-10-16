@@ -15,6 +15,7 @@ OUT.mkdir(exist_ok=True)
 STUB = "--stub" in sys.argv
 STUB_PROMPTS = STUB or "--stub-prompts" in sys.argv
 LIB = (SRC / "code" / "_lib.js").read_text()
+FILES = (SRC / "code" / "_files.js").read_text()
 UNZIP = (SRC / "code" / "wf2" / "_unzip.js").read_text()
 MODEL_ID = "claude-sonnet-5-5"
 DATA_TABLE_ID = "9mMnRlpTU4S4ezRU"  # qa_runs
@@ -45,6 +46,8 @@ def code(name: str) -> str:
     if STUB:
         return json.dumps(f"return $input.all(); // stub {name}")
     body = (SRC / "code" / f"{name}.js").read_text()
+    if re.search(r"\b(assertFiles|FILE_SCHEMA)\b", body):
+        body = FILES + "\n" + body
     if re.search(r"\b(parseAgentJson|assertSchema|assertFiles|FILE_SCHEMA)\b", body):
         body = LIB + "\n" + body
     if re.search(r"\bunzip\(", body):
